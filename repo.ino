@@ -1,169 +1,139 @@
+#include <Wire.h>
 #include "I2Cdev.h"
-#include <PID_v1.h> // PID 控制函式庫
-#include "MPU6050_6Axis_MotionApps20.h" // 使用 DMP 的 MPU6050 函式庫
+#include "MPU6050_6Axis_MotionApps20.h"
+#include <PID_v1.h>
 
+// MPU6050 與 DMP
 MPU6050 mpu;
+bool dmpReady = false;
+uint8_t mpuIntStatus;
+uint8_t devStatus;
+uint16_t packetSize;
+uint16_t fifoCount;
+uint8_t fifoBuffer[64];
 
-// MPU 控制/狀態變數
-bool dmpReady = false;              // DMP 初始化成功與否
-uint8_t mpuIntStatus;               // MPU 中斷狀態
-uint8_t devStatus;                  // DMP 初始化狀態碼 (0 為成功)
-uint16_t packetSize;                // DMP 資料包大小
-uint16_t fifoCount;                 // FIFO 中的位元組數
-uint8_t fifoBuffer[64];            // FIFO 資料緩衝區
+Quaternion q;
+VectorFloat gravity;
+float ypr[3];  // [yaw, pitch, roll]
 
-// 姿態與重力計算變數
-Quaternion q;                       // 四元數
-VectorFloat gravity;                // 重力向量
-float ypr[3];                       // Yaw, Pitch, Roll
-
-// ----------- PID 參數設定（需手動調整）-----------
-double setpoint = 182;              // 小車平衡角度（從序列監控取得）
-double Kp = 20;                     // 比例參數（調平衡反應強度）
-double Ki = 140;                    // 積分參數（抑制誤差累積）
-double Kd = 0.8;                    // 微分參數（抑制震盪）
-
-double input, output;               // PID 輸入與輸出變數
-
+// PID
+double input, output, setpoint = 0.0;
+// 調整後的參數，減小震盪
+double Kp = 42.0, Ki = 0.9, Kd = 4;
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 
-// MPU 中斷旗標（由中斷服務程式設定）
-volatile bool mpuInterrupt = false;
+// 馬達腳位
+#define IN1M 7
+#define IN2M 6
+#define PWMA 9
+#define IN3M 13
+#define IN4M 12
+#define PWMB 10
+#define STBY 8
 
-// MPU 中斷觸發處理（僅設置旗標）
-void dmpDataReady() {
-  mpuInterrupt = true;
+void initMotorPins() {
+  pinMode(IN1M, OUTPUT); pinMode(IN2M, OUTPUT);
+  pinMode(PWMA, OUTPUT);
+  pinMode(IN3M, OUTPUT); pinMode(IN4M, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+  pinMode(STBY, OUTPUT);
+  digitalWrite(STBY, HIGH);
 }
 
-// 馬達前進
-void Forward() {
-  analogWrite(6, output);
-  analogWrite(9, 0);
-  analogWrite(10, output);
-  analogWrite(11, 0);
-  Serial.print("F");
+void stop() {
+  setMotorSpeed(0);
+  while (1) {
+    Serial.println("請重製小車");
+    delay(5000);
+  }
 }
 
-// 馬達後退
-void Reverse() {
-  analogWrite(6, 0);
-  analogWrite(9, -output);  // 注意：output 為負值
-  analogWrite(10, 0);
-  analogWrite(11, -output);
-  Serial.print("R");
-}
+void setMotorSpeed(float speed) {
+  speed = constrain(speed, -255, 255);
+  int pwm = abs(speed);
+  if (pwm < 30) pwm = 0;
 
-// 馬達停止
-void Stop() {
-  analogWrite(6, 0);
-  analogWrite(9, 0);
-  analogWrite(10, 0);
-  analogWrite(11, 0);
-  Serial.print("S");
+  if (speed < 0) {
+    digitalWrite(IN1M, HIGH); digitalWrite(IN2M, LOW);
+    digitalWrite(IN3M, HIGH); digitalWrite(IN4M, LOW);
+  } else {
+    digitalWrite(IN1M, LOW); digitalWrite(IN2M, HIGH);
+    digitalWrite(IN3M, LOW); digitalWrite(IN4M, HIGH);
+  }
+
+  analogWrite(PWMA, pwm);
+  analogWrite(PWMB, pwm);
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("初始化 I2C 裝置..."));
-  mpu.initialize();  // 啟動 MPU6050
+  Wire.begin();
+  initMotorPins();
 
-  Serial.println(F("檢查 MPU6050 是否連線..."));
-  Serial.println(mpu.testConnection() ? F("成功") : F("失敗"));
-
-  // 初始化 DMP
+  mpu.initialize();
   devStatus = mpu.dmpInitialize();
 
-  // 設定陀螺儀與加速度計偏移值（視硬體調整）
-  mpu.setXGyroOffset(57);
-  mpu.setYGyroOffset(-29);
-  mpu.setZGyroOffset(3);
-  mpu.setZAccelOffset(967);
+  // MPU 偏移值（依實際校準）
+  mpu.setXAccelOffset(-3353);
+  mpu.setYAccelOffset(97);
+  mpu.setZAccelOffset(123);
+  mpu.setXGyroOffset(81);
+  mpu.setYGyroOffset(-30);
+  mpu.setZGyroOffset(63);
 
   if (devStatus == 0) {
-    Serial.println(F("啟用 DMP..."));
     mpu.setDMPEnabled(true);
-
-    Serial.println(F("啟用外部中斷 INT0..."));
-    attachInterrupt(0, dmpDataReady, RISING); // D2 腳位
-
-    mpuIntStatus = mpu.getIntStatus();
     dmpReady = true;
-
-    packetSize = mpu.dmpGetFIFOPacketSize(); // 計算 DMP 資料包大小
-
-    // 設定 PID
-    pid.SetMode(AUTOMATIC);
-    pid.SetSampleTime(10);                 // 每 10ms 更新一次
-    pid.SetOutputLimits(-255, 255);        // 對應 PWM 最大範圍
+    packetSize = mpu.dmpGetFIFOPacketSize();
+    Serial.println("DMP 啟動完成");
   } else {
-    Serial.print(F("DMP 初始化失敗，錯誤碼："));
+    Serial.print("DMP 啟動失敗，錯誤碼: ");
     Serial.println(devStatus);
-    while (1) {
-      Serial.println(F("請檢查 MPU 接線或硬體是否正常"));
-      delay(1000);  // 停止執行
-    }
+    while (1);
   }
 
-  // 馬達控制腳位設定為輸出
-  pinMode(6, OUTPUT);
-  pinMode(9, OUTPUT);
-  pinMode(10, OUTPUT);
-  pinMode(11, OUTPUT);
-
-  // 預設關閉馬達
-  Stop();
+  pid.SetMode(AUTOMATIC);
+  pid.SetOutputLimits(-255, 255);
+  pid.SetSampleTime(5);  // 改成 5 毫秒，給系統反應時間
 }
 
+// 移動平均濾波用的緩衝區及索引
+float angleBuffer[3] = {0};
+int idx = 0;
+
 void loop() {
-  // 如果 DMP 還沒準備好，就不執行主邏輯
   if (!dmpReady) return;
 
-  // 若無中斷觸發且 FIFO 不足一包資料，就繼續運作 PID 控制
-  while (!mpuInterrupt && fifoCount < packetSize) {
-    pid.Compute();  // 執行 PID 控制
-    Serial.print("角度："); Serial.print(input);
-    Serial.print(" => PID 輸出："); Serial.println(output);
-
-    if (input > 150 && input < 200) { // 角度偏移合理範圍
-      if (output > 0)
-        Forward(); // 向前傾倒，驅動前進
-      else if (output < 0)
-        Reverse(); // 向後傾倒，驅動後退
-    } else {
-      Stop(); // 角度過大，直接停車
-    }
-  }
-
-  // 清除中斷旗標
-  mpuInterrupt = false;
-
-  // 讀取中斷狀態
-  mpuIntStatus = mpu.getIntStatus();
   fifoCount = mpu.getFIFOCount();
 
-  // 處理 FIFO 溢出錯誤
-  if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
+  if (fifoCount == 1024) {
     mpu.resetFIFO();
-    Serial.println(F("FIFO 溢出錯誤！已重置"));
+    Serial.println("FIFO 溢出");
     return;
   }
 
-  // 有有效的 DMP 資料可讀取
-  if (mpuIntStatus & 0x02) {
-    // 確保 FIFO 至少一包資料
-    while (fifoCount < packetSize)
-      fifoCount = mpu.getFIFOCount();
-
-    // 讀取 DMP 資料包
+  if (fifoCount >= packetSize) {
     mpu.getFIFOBytes(fifoBuffer, packetSize);
-    fifoCount -= packetSize;
+    mpu.dmpGetQuaternion(&q, fifoBuffer);
+    mpu.dmpGetGravity(&gravity, &q);
+    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
-    // 解析 DMP 資料
-    mpu.dmpGetQuaternion(&q, fifoBuffer);          // 四元數
-    mpu.dmpGetGravity(&gravity, &q);               // 重力向量
-    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);     // 姿態角度
+    // 讀取 roll (ypr[2]) 並轉成度
+    angleBuffer[idx] = ypr[2] * 180.0 / M_PI;
+    idx = (idx + 1) % 3;
+    input = (angleBuffer[0] + angleBuffer[1] + angleBuffer[2]) / 3.0;
 
-    // 將 Pitch（俯仰）角轉換為角度作為 PID 輸入
-    input = ypr[1] * 180 / M_PI + 180;  // 轉換為 0~360 度範圍
+    if (input < -50 || input > 50) {
+      stop();
+    }
+
+    pid.Compute();
+
+    setMotorSpeed(output);
+
+    Serial.print("Pitch: ");
+    Serial.print(input, 2);
+    Serial.print(" | Output: ");
+    Serial.println(output, 2);
   }
 }
