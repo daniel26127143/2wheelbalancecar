@@ -6,7 +6,6 @@
 // MPU6050 與 DMP
 MPU6050 mpu;
 bool dmpReady = false;
-uint8_t mpuIntStatus;
 uint8_t devStatus;
 uint16_t packetSize;
 uint16_t fifoCount;
@@ -17,9 +16,8 @@ VectorFloat gravity;
 float ypr[3];  // [yaw, pitch, roll]
 
 // PID
-double input, output, setpoint = 0.0;
-// 調整後的參數，減小震盪
-double Kp = 42.0, Ki = 0.9, Kd = 4;
+double input, output, setpoint = 0.5;
+double Kp = 45.0, Ki = 0.5, Kd = 2;
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 
 // 馬達腳位
@@ -44,7 +42,7 @@ void stop() {
   setMotorSpeed(0);
   while (1) {
     Serial.println("請重製小車");
-    delay(5000);
+    while(1){}
   }
 }
 
@@ -66,7 +64,7 @@ void setMotorSpeed(float speed) {
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   Wire.begin();
   initMotorPins();
 
@@ -94,10 +92,10 @@ void setup() {
 
   pid.SetMode(AUTOMATIC);
   pid.SetOutputLimits(-255, 255);
-  pid.SetSampleTime(5);  // 改成 5 毫秒，給系統反應時間
+  pid.SetSampleTime(5);
 }
 
-// 移動平均濾波用的緩衝區及索引
+// 移動平均濾波
 float angleBuffer[3] = {0};
 int idx = 0;
 
@@ -112,30 +110,37 @@ void loop() {
     return;
   }
 
-  if (fifoCount >= packetSize) {
+  // 清空 FIFO，保留最新一筆資料
+  while ((fifoCount = mpu.getFIFOCount()) >= packetSize) {
     mpu.getFIFOBytes(fifoBuffer, packetSize);
-    mpu.dmpGetQuaternion(&q, fifoBuffer);
-    mpu.dmpGetGravity(&gravity, &q);
-    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+  }
 
-    // 讀取 roll (ypr[2]) 並轉成度
-    angleBuffer[idx] = ypr[2] * 180.0 / M_PI;
+  // 解析 DMP 資料
+  mpu.dmpGetQuaternion(&q, fifoBuffer);
+  mpu.dmpGetGravity(&gravity, &q);
+  mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
-    //使用三個數據平均
-    idx = (idx + 1) % 3;
-    input = (angleBuffer[0] + angleBuffer[1] + angleBuffer[2]) / 3.0;
+  // 平滑處理 roll（ypr[2]）
+  angleBuffer[idx] = ypr[2] * 180.0 / M_PI;
+  idx = (idx + 1) % 3;
+  input = (angleBuffer[0] + angleBuffer[1] + angleBuffer[2]) / 3.0;
 
-    if (input < -50 || input > 50) {
-      stop();
-    }
+  if (input < -50 || input > 50) {
+    stop();
+  }
 
-    pid.Compute();
+  pid.Compute();
+  setMotorSpeed(output);
 
-    setMotorSpeed(output);
-
-    Serial.print("Pitch: ");
-    Serial.print(input, 2);
-    Serial.print(" | Output: ");
-    Serial.println(output, 2);
+  // 降低印出頻率
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 100) {
+    lastPrint = millis();
+    Serial.print("Raw angles: ");
+    Serial.print(angleBuffer[0], 2); Serial.print(", ");
+    Serial.print(angleBuffer[1], 2); Serial.print(", ");
+    Serial.print(angleBuffer[2], 2);
+    Serial.print(" | Avg: "); Serial.print(input, 2);
+    Serial.print(" | Output: "); Serial.println(output, 2);
   }
 }
