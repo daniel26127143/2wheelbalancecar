@@ -15,9 +15,10 @@ Quaternion q;
 VectorFloat gravity;
 float ypr[3];  // [yaw, pitch, roll]
 
-// PID
-double input, output, setpoint = 0.5;
-double Kp = 45.0, Ki = 0.5, Kd = 2;
+// PID 測試
+double input, output, setpoint = -1; //電源線反方向
+double Kp = 63.0, Ki = 220.0, Kd = 1.6;
+
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 
 // 馬達腳位
@@ -41,7 +42,11 @@ void initMotorPins() {
 void stop() {
   setMotorSpeed(0);
   while (1) {
+    Serial.print("Kp="); Serial.print(Kp, 2);
+    Serial.print(" Ki="); Serial.print(Ki, 2);
+    Serial.print(" Kd="); Serial.println(Kd, 2);
     Serial.println("請重製小車");
+    
     while(1){}
   }
 }
@@ -49,7 +54,7 @@ void stop() {
 void setMotorSpeed(float speed) {
   speed = constrain(speed, -255, 255);
   int pwm = abs(speed);
-  if (pwm < 30) pwm = 0;
+  if (pwm < 5) pwm = 0;
 
   if (speed < 0) {
     digitalWrite(IN1M, HIGH); digitalWrite(IN2M, LOW);
@@ -136,11 +141,12 @@ void loop() {
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint > 100) {
     lastPrint = millis();
-    Serial.print("Raw angles: ");
-    Serial.print(angleBuffer[0], 2); Serial.print(", ");
-    Serial.print(angleBuffer[1], 2); Serial.print(", ");
-    Serial.print(angleBuffer[2], 2);
-    Serial.print(" | Avg: "); Serial.print(input, 2);
-    Serial.print(" | Output: "); Serial.println(output, 2);
+    Serial.print(" Avg: "); Serial.print(input, 2);
+    // Serial.print(" |Raw angles: ");
+    // Serial.print(angleBuffer[0], 2); Serial.print(", ");
+    // Serial.print(angleBuffer[1], 2); Serial.print(", ");
+    // Serial.print(angleBuffer[2], 2);
+    Serial.print(" | Output: "); Serial.print(output, 2);
+    Serial.print(" | Error: "); Serial.println(setpoint - input, 2);
   }
 }
