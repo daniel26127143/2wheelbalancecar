@@ -16,7 +16,7 @@ VectorFloat gravity;
 float ypr[3];  // [yaw, pitch, roll]
 
 // PID 測試
-double input, output, setpoint = -1; //電源線反方向
+double input, output, setpoint = -1; // 電源線反方向
 double Kp = 63.0, Ki = 220.0, Kd = 1.6;
 
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
@@ -29,6 +29,9 @@ PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 #define IN4M 12
 #define PWMB 10
 #define STBY 8
+
+// Flag
+volatile bool flag_5ms = false;
 
 void initMotorPins() {
   pinMode(IN1M, OUTPUT); pinMode(IN2M, OUTPUT);
@@ -46,7 +49,6 @@ void stop() {
     Serial.print(" Ki="); Serial.print(Ki, 2);
     Serial.print(" Kd="); Serial.println(Kd, 2);
     Serial.println("請重製小車");
-    
     while(1){}
   }
 }
@@ -98,55 +100,75 @@ void setup() {
   pid.SetMode(AUTOMATIC);
   pid.SetOutputLimits(-255, 255);
   pid.SetSampleTime(5);
+
+  // --- Timer2 設定，每 5ms 進一次 ISR ---
+  cli(); // 關中斷
+  TCCR2A = 0;
+  TCCR2B = 0;
+  TCNT2  = 0;
+  OCR2A = 124;              // 125 次計數 = 1ms (8MHz/64 prescaler)
+  TCCR2A |= (1 << WGM21);   // CTC 模式
+  TCCR2B |= (1 << CS22);    // 預分頻 64
+  TIMSK2 |= (1 << OCIE2A);  // 開啟比較中斷
+  sei(); // 開中斷
 }
 
 // 移動平均濾波
 float angleBuffer[3] = {0};
 int idx = 0;
 
+ISR(TIMER2_COMPA_vect) {
+  static int count = 0;
+  count++;
+  if (count >= 5) {   // 5ms 觸發一次
+    count = 0;
+    flag_5ms = true;
+  }
+}
+
 void loop() {
-  if (!dmpReady) return;
+  if (flag_5ms) {
+    flag_5ms = false;   // 清除旗標
 
-  fifoCount = mpu.getFIFOCount();
+    if (!dmpReady) return;
 
-  if (fifoCount == 1024) {
-    mpu.resetFIFO();
-    Serial.println("FIFO 溢出");
-    return;
-  }
+    fifoCount = mpu.getFIFOCount();
 
-  // 清空 FIFO，保留最新一筆資料
-  while ((fifoCount = mpu.getFIFOCount()) >= packetSize) {
-    mpu.getFIFOBytes(fifoBuffer, packetSize);
-  }
+    if (fifoCount == 1024) {
+      mpu.resetFIFO();
+      Serial.println("FIFO 溢出");
+      return;
+    }
 
-  // 解析 DMP 資料
-  mpu.dmpGetQuaternion(&q, fifoBuffer);
-  mpu.dmpGetGravity(&gravity, &q);
-  mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+    // 清空 FIFO，保留最新一筆資料
+    while ((fifoCount = mpu.getFIFOCount()) >= packetSize) {
+      mpu.getFIFOBytes(fifoBuffer, packetSize);
+    }
 
-  // 平滑處理 roll（ypr[2]）
-  angleBuffer[idx] = ypr[2] * 180.0 / M_PI;
-  idx = (idx + 1) % 3;
-  input = (angleBuffer[0] + angleBuffer[1] + angleBuffer[2]) / 3.0;
+    // 解析 DMP 資料
+    mpu.dmpGetQuaternion(&q, fifoBuffer);
+    mpu.dmpGetGravity(&gravity, &q);
+    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
-  if (input < -50 || input > 50) {
-    stop();
-  }
+    // 平滑處理 roll（ypr[2]）
+    angleBuffer[idx] = ypr[2] * 180.0 / M_PI;
+    idx = (idx + 1) % 3;
+    input = (angleBuffer[0] + angleBuffer[1] + angleBuffer[2]) / 3.0;
 
-  pid.Compute();
-  setMotorSpeed(output);
+    if (input < -50 || input > 50) {
+      stop();
+    }
 
-  // 降低印出頻率
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 100) {
-    lastPrint = millis();
-    Serial.print(" Avg: "); Serial.print(input, 2);
-    // Serial.print(" |Raw angles: ");
-    // Serial.print(angleBuffer[0], 2); Serial.print(", ");
-    // Serial.print(angleBuffer[1], 2); Serial.print(", ");
-    // Serial.print(angleBuffer[2], 2);
-    Serial.print(" | Output: "); Serial.print(output, 2);
-    Serial.print(" | Error: "); Serial.println(setpoint - input, 2);
+    pid.Compute();
+    setMotorSpeed(output);
+
+    // 降低印出頻率
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 100) {
+      lastPrint = millis();
+      Serial.print(" Avg: "); Serial.print(input, 2);
+      Serial.print(" | Output: "); Serial.print(output, 2);
+      Serial.print(" | Error: "); Serial.println(setpoint - input, 2);
+    }
   }
 }
