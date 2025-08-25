@@ -3,6 +3,16 @@
 #include "MPU6050_6Axis_MotionApps20.h"
 #include <PID_v1.h>
 
+// --- 分區 PWM 設定 ---
+float zone1_limit = 2;     // |input| < 2
+float zone2_limit = 3;     // |input| < 3
+// float zone3_limit = 4;     // |input| < 4
+
+float zone1_gain = 0.95;    // 小角度修正比較弱
+float zone2_gain = 1.0;    // 中角度修正稍強
+float zone3_gain = 1.1;    // 大角度修正更強
+float fall_angle_limit = 40;  // 超過 ±40 度就停車
+
 // MPU6050 與 DMP
 MPU6050 mpu;
 bool dmpReady = false;
@@ -18,7 +28,6 @@ float ypr[3];  // [yaw, pitch, roll]
 // PID 測試
 double input, output, setpoint = -1; // 電源線反方向
 double Kp = 63.0, Ki = 220.0, Kd = 1.6;
-
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 
 // 馬達腳位
@@ -128,7 +137,7 @@ ISR(TIMER2_COMPA_vect) {
 
 void loop() {
   if (flag_5ms) {
-    flag_5ms = false;   // 清除旗標
+    flag_5ms = false;
 
     if (!dmpReady) return;
 
@@ -140,34 +149,51 @@ void loop() {
       return;
     }
 
-    // 清空 FIFO，保留最新一筆資料
     while ((fifoCount = mpu.getFIFOCount()) >= packetSize) {
       mpu.getFIFOBytes(fifoBuffer, packetSize);
     }
 
-    // 解析 DMP 資料
     mpu.dmpGetQuaternion(&q, fifoBuffer);
     mpu.dmpGetGravity(&gravity, &q);
     mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
-    // 平滑處理 roll（ypr[2]）
     angleBuffer[idx] = ypr[2] * 180.0 / M_PI;
     idx = (idx + 1) % 3;
     input = (angleBuffer[0] + angleBuffer[1] + angleBuffer[2]) / 3.0;
 
-    if (input < -50 || input > 50) {
+    if (abs(input) > fall_angle_limit){
       stop();
     }
 
     pid.Compute();
+
+    // 分區 PWM 加成 & 區域紀錄
+    int current_zone = 0;
+    if (abs(input) < zone1_limit) {
+      output *= zone1_gain;
+      current_zone = 1;
+    } else if (abs(input) < zone2_limit) {
+      output *= zone2_gain;
+      current_zone = 2;
+    } else if (abs(input) >= zone2_limit) {
+      output *= zone3_gain;
+      current_zone = 3;
+    }
+
+    if (output > 255) {
+      output = 255;
+    } else if (output < -255) {
+      output = -255;
+    }
+
     setMotorSpeed(output);
 
-    // 降低印出頻率
     static unsigned long lastPrint = 0;
     if (millis() - lastPrint > 100) {
       lastPrint = millis();
       Serial.print(" Avg: "); Serial.print(input, 2);
       Serial.print(" | Output: "); Serial.print(output, 2);
+      Serial.print(" | Zone: "); Serial.print(current_zone);
       Serial.print(" | Error: "); Serial.println(setpoint - input, 2);
     }
   }
