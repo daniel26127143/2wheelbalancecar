@@ -3,7 +3,7 @@
 #include "MPU6050_6Axis_MotionApps20.h"
 #include <PID_v1.h>
 
-// --- 分區 PWM 設定 ---
+// 分區 PWM 設定 
 float zone1_limit = 2;       // |input| < 2
 float zone2_limit = 3;       // |input| < 3
 // float zone3_limit = 4;     // |input| < 4
@@ -25,14 +25,15 @@ Quaternion q;
 VectorFloat gravity;
 float ypr[3];  // [yaw, pitch, roll]
 
-// 核心控制變數：新增用於 ISR/loop 傳遞的角度和傾倒旗標
+// 用於ISR和Loop中傳遞當前的角度和小車已倒下旗標
 volatile float currentDMPAngle = 0.0;
 volatile bool is_fallen = false;
 int current_zone = 0; // 用於在 loop() 中列印區域
 
-// PID 測試
-double input, output, setpoint = -1; // 電源線反方向
-double Kp = 63.0, Ki = 220.0, Kd = 1.6;
+// PID
+double input, output, setpoint = -3.7; // 電源線反方向設定
+// double Kp = 63.0, Ki = 220.0, Kd = 2;
+double Kp = 50.0, Ki = 200, Kd = 2.4;
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 
 // 馬達腳位
@@ -44,8 +45,8 @@ PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 #define PWMB 10
 #define STBY 8
 
-// Flag
-volatile bool flag_5ms = false; // 保留原來的旗標定義
+// FLAG 暫時刪除
+// volatile bool flag_5ms = false; 
 
 void initMotorPins() {
   pinMode(IN1M, OUTPUT); pinMode(IN2M, OUTPUT);
@@ -55,10 +56,9 @@ void initMotorPins() {
   pinMode(STBY, OUTPUT);
   digitalWrite(STBY, HIGH);
 }
-
+// 小車傾倒後的副程式
 void stop() {
   setMotorSpeed(0);
-  // 這裡進入無限迴圈，只在 loop() 執行 is_fallen 檢查時呼叫
   while (1) {
     Serial.print("Kp="); Serial.print(Kp, 2);
     Serial.print(" Ki="); Serial.print(Ki, 2);
@@ -68,7 +68,7 @@ void stop() {
     while (1){}
   }
 }
-
+// 設定小車的速度
 void setMotorSpeed(float speed) {
   speed = constrain(speed, -255, 255);
   int pwm = abs(speed);
@@ -94,7 +94,7 @@ void setup() {
   mpu.initialize();
   devStatus = mpu.dmpInitialize();
 
-  // MPU 偏移值（依實際校準）
+  // 設定此 MPU 偏移值
   mpu.setXAccelOffset(-3353);
   mpu.setYAccelOffset(97);
   mpu.setZAccelOffset(123);
@@ -117,7 +117,7 @@ void setup() {
   pid.SetOutputLimits(-255, 255);
   pid.SetSampleTime(5);
 
-  // --- Timer2 設定，每 1ms 進一次 ISR ---
+  // TIMER2設定 目前設定1ms的中段並且在ISR裡面使用 count++到5ms
   cli(); // 關中斷
   TCCR2A = 0;
   TCCR2B = 0;
@@ -129,38 +129,34 @@ void setup() {
   sei(); // 開中斷
 }
 
-// 移動平均濾波（留在 global，在 loop() 中處理）
+// 移動平均濾波
 float angleBuffer[3] = {0};
 int idx = 0;
 
-// ISR: 僅負責精準計時和核心控制運算
+// ISR 
 ISR(TIMER2_COMPA_vect) {
   static int count = 0;
   count++;
   if (count >= 5) {    // 5ms 觸發一次，執行核心控制
     count = 0;
-    flag_5ms = true; // 保留旗標，但主要邏輯已移入
-
-    // 檢查是否傾倒，如果是就停止並退出
+    // 檢查是否傾倒，如果是就停車並退出準備執行stop()
     if (is_fallen) {
         setMotorSpeed(0);
         return;
     }
     
-    // 1. PID 輸入：使用 loop() 中最新讀取到的 DMP 角度
+    // 獲取從Loop()更新的最新值作為輸入
     input = currentDMPAngle; 
 
-    // 2. 傾倒判斷 (設定旗標，讓 loop() 執行 stop())
+    // 傾倒判斷
     if (abs(input) > fall_angle_limit){
         setMotorSpeed(0); // 立即停止馬達
         is_fallen = true; // 設定傾倒旗標
         return; 
     }
-
-    // 3. 執行 PID 運算
     pid.Compute();
 
-    // 4. 分區 PWM 加成 & 區域紀錄
+    // 分區 PWM 加成 & 區域紀錄
     current_zone = 0;
     if (abs(input) < zone1_limit) {
         output *= zone1_gain;
@@ -173,7 +169,7 @@ ISR(TIMER2_COMPA_vect) {
         current_zone = 3;
     }
 
-    // 5. 限制輸出並控制馬達
+    // 限制輸出並控制馬達
     output = constrain(output, -255, 255);
     setMotorSpeed(output);
   }
@@ -186,8 +182,7 @@ void loop() {
         stop();
     }
     
-    // 執行耗時的 DMP 數據讀取 (I2C 通訊)
-    // 這裡不再依賴 flag_5ms，而是盡快讀取數據
+    // 執行DMP 數據讀取
     if (!dmpReady) return;
 
     fifoCount = mpu.getFIFOCount();
@@ -198,7 +193,6 @@ void loop() {
       return;
     }
 
-    // 每次只讀取一個最新的數據包，減少延遲
     if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
 
       mpu.dmpGetQuaternion(&q, fifoBuffer);
@@ -206,13 +200,13 @@ void loop() {
       float ypr_temp[3]; // 使用區域變數
       mpu.dmpGetYawPitchRoll(ypr_temp, &q, &gravity);
 
-      // 濾波並更新全域角度變數供 ISR 使用 (關鍵數據傳輸)
+      // 濾波並更新全域角度變數供 ISR 使用
       angleBuffer[idx] = ypr_temp[2] * 180.0 / M_PI;
       idx = (idx + 1) % 3;
       currentDMPAngle = (angleBuffer[0] + angleBuffer[1] + angleBuffer[2]) / 3.0;
     }
 
-    // 序列埠列印 (非時序敏感)
+    // 序列埠列印
     static unsigned long lastPrint = 0;
     if (millis() - lastPrint > 100) {
       lastPrint = millis();
