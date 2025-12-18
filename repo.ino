@@ -2,15 +2,17 @@
 #include "I2Cdev.h"
 #include "MPU6050_6Axis_MotionApps20.h"
 #include <PID_v1.h>
+// 徑度角度的轉換常數
+//const float DEG_TO_RAD = 0.0174533f; // (PI / 180.0) 因為原本就有定義了 重新定義會出錯先註解
 
 // 分區 PWM 設定
-float zone1_limit = 2;  // |input| < 2
-float zone2_limit = 3;  // |input| < 3
+float zone1_limit = 2 * DEG_TO_RAD;  // |input| < 2
+float zone2_limit = 3 * DEG_TO_RAD;  // |input| < 3
 
 float zone1_gain = 0.95;      // 小角度修正比較弱
 float zone2_gain = 1.0;       // 中角度修正稍強
 float zone3_gain = 1.1;       // 大角度修正更強
-float fall_angle_limit = 40;  // 超過 ±40 度就停車
+float fall_angle_limit = 40 * DEG_TO_RAD;  // 超過 ±40 度就停車
 
 // MPU6050 與 DMP
 MPU6050 mpu;
@@ -36,8 +38,9 @@ volatile bool is_fallen = false;
 int current_zone = 0; 
 
 // PID
-double input, output, setpoint = -2.5;  // 電源線反方向設定
-double Kp = 50.0, Ki = 200, Kd = 2.4;   // 參數記得根據測試結果調整
+double input, output, setpoint = -2.5 * DEG_TO_RAD;  // 電源線反方向設定
+// double Kp = 50.0, Ki = 200, Kd = 2.4;   // 角度的
+double Kp = 2864.0, Ki = 11459.0, Kd = 137.4;   // 更改為徑度的
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 
 // 馬達腳位
@@ -163,7 +166,7 @@ ISR(TIMER2_COMPA_vect) {
       float ypr_temp[3];
       mpu.dmpGetYawPitchRoll(ypr_temp, &q, &gravity);
       
-      float raw_angle = ypr_temp[2] * 180.0 / M_PI;
+      float raw_angle = ypr_temp[2];
       
       // 3筆平均濾波
       angleBuffer[idx] = raw_angle;
