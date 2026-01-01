@@ -6,13 +6,15 @@
 //const float DEG_TO_RAD = 0.0174533f; // (PI / 180.0) 因為原本就有定義了 重新定義會出錯先註解
 
 // 分區 PWM 設定
-float zone1_limit = 2 * DEG_TO_RAD;  // |input| < 2
-float zone2_limit = 3 * DEG_TO_RAD;  // |input| < 3
-
+float zone1_limit = 2 * DEG_TO_RAD;        // |input| < 2
+float zone2_limit = 3 * DEG_TO_RAD;        // |input| < 3
 float zone1_gain = 0.95;                   // 小角度修正比較弱
 float zone2_gain = 1.0;                    // 中角度修正稍強
 float zone3_gain = 1.1;                    // 大角度修正更強
 float fall_angle_limit = 40 * DEG_TO_RAD;  // 超過 ±40 度就停車
+
+// 用於扶正回復時的計數器
+unsigned long recovery_counter = 0;
 
 // MPU6050 與 DMP
 MPU6050 mpu;
@@ -65,13 +67,6 @@ void initMotorPins() {
 
 void stop() {
   setMotorSpeed(0);
-  while (1) {
-    Serial.println("小車已傾倒，請重製");
-    digitalWrite(led, HIGH);
-    delay(100);
-    digitalWrite(led, LOW);
-    delay(100);
-  }
 }
 
 void setMotorSpeed(float speed) {
@@ -143,25 +138,25 @@ void setup() {
   sei();
 }
 ISR(TIMER2_COMPA_vect) {
+  // 宣告中斷秒數的變數
   static int count = 0;
   count++;
 
-  // 1. 提早跳出 (10ms 執行一次)
+  // 檢查是否到中斷時間
   if (count < 10) {
     return;
   }
   count = 0;
 
-  // 2. 開啟巢狀中斷 (允許 I2C)
+  // 以下進入真正的中斷
   sei();
-
   digitalWrite(led, HIGH);
 
-  // 定義靜態變數 (用於 3 筆平均濾波)
+  // 宣告用於三筆平均濾波的變數
   static float angleBuffer[3] = { 0.0, 0.0, 0.0 };
   static int idx = 0;
 
-  // 3. 讀取 FIFO
+  // 讀取 FIFO
   fifoCount = mpu.getFIFOCount();
   if (fifoCount == 1024) {
     mpu.resetFIFO();
@@ -174,10 +169,10 @@ ISR(TIMER2_COMPA_vect) {
     mpu.dmpGetGravity(&gravity, &q);
     float ypr_temp[3];
     mpu.dmpGetYawPitchRoll(ypr_temp, &q, &gravity);
-
+    // 取得原始徑度
     float raw_angle = ypr_temp[2];
 
-    // 3筆平均濾波
+    // 三筆平均濾波
     angleBuffer[idx] = raw_angle;
     idx = (idx + 1) % 3;
     currentDMPAngle = (angleBuffer[0] + angleBuffer[1] + angleBuffer[2]) / 3.0;
@@ -188,37 +183,59 @@ ISR(TIMER2_COMPA_vect) {
     return;
   }
 
-  // 4. 傾倒保護
-  if (abs(input) > fall_angle_limit || is_fallen) {
-    return_output = 0;
-    is_fallen = true;
-    pid_computed = true;
-    digitalWrite(led, LOW);
-    return;
+  // 判斷PID計算和是否傾倒偵測
+  if (!is_fallen) {
+    // 傾倒偵測 如果小車角度已經超過設定的傾倒角度 設定倒下旗標
+    if (abs(input) > fall_angle_limit) {
+      is_fallen = true;      // 設定倒下旗標
+      return_output = 0;     // 停止馬達
+      recovery_counter = 0;  // 清除回正計數器
+    }
+    // 計算PID並且使用分區增益
+    else {
+      pid.Compute();
+      // 分區增益邏輯
+      current_zone = 0;
+      if (abs(input) < zone1_limit) {
+        output *= zone1_gain;
+        current_zone = 1;
+      } else if (abs(input) < zone2_limit) {
+        output *= zone2_gain;
+        current_zone = 2;
+      } else {
+        output *= zone3_gain;
+        current_zone = 3;
+      }
+
+      output = constrain(output, -255, 255);
+      return_output = output;
+    }
+  }
+  // 已經倒下需要判斷是否扶正，並且讓recovery_counter計數
+  else {
+    return_output = 0;  // 確保馬達完全不動
+    // 判斷是否扶正(與中心 < 5 角度)
+    if (abs(input - setpoint) < (5 * DEG_TO_RAD)) {
+      recovery_counter++;  // 回復計數器++
+
+      // 判斷是否已經扶正1秒鐘 (10ms x 100times = 1000ms)
+      if (recovery_counter >= 100) {
+        is_fallen = false;     // 取消傾倒狀態
+        recovery_counter = 0;  // 回復計數器歸零
+
+        // 重置 PID 積分項 (避免暴衝)
+        pid.SetMode(MANUAL);
+        pid.SetMode(AUTOMATIC);
+      }
+    } else {
+      //recovery_counter = 0;
+    }
   }
 
-  // 5. PID 計算
-  pid.Compute();
+  // ==========================================================
 
-  // 6. 分區增益邏輯 (保留在 ISR 計算，Loop 不用再算一次)
-  current_zone = 0;
-  if (abs(input) < zone1_limit) {
-    output *= zone1_gain;
-    current_zone = 1;
-  } else if (abs(input) < zone2_limit) {
-    output *= zone2_gain;
-    current_zone = 2;
-  } else {
-    output *= zone3_gain;
-    current_zone = 3;
-  }
-
-  output = constrain(output, -255, 255);
-  return_output = output;
+  // 放置PID計算完成旗標，告訴Loop可以正常工作
   pid_computed = true;
-  // 傳送到matlab
-  static int print_count = 0;
-  print_count++;
   digitalWrite(led, LOW);
 }
 
@@ -233,9 +250,6 @@ void loop() {
     setMotorSpeed(motor_cmd);
     pid_computed = false;
   }
-
-
-  //if (!dmpReady) return;
 
   // 3. 序列埠列印 (傳給 MATLAB)
   static unsigned long lastPrint = 0;
