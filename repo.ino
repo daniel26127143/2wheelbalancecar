@@ -8,15 +8,17 @@
 // 分區 PWM 設定
 float zone1_limit = 2 * DEG_TO_RAD;        // |input| < 2
 float zone2_limit = 3 * DEG_TO_RAD;        // |input| < 3
-float zone1_gain = 0.95;                   // 小角度修正比較弱
-float zone2_gain = 1.0;                    // 中角度修正稍強
-float zone3_gain = 1.1;                    // 大角度修正更強
+float zone1_gain = 0.95;                   // 小角度增益
+float zone2_gain = 1.0;                    // 中角度增益
+float zone3_gain = 1.1;                    // 大角度增益
 float fall_angle_limit = 40 * DEG_TO_RAD;  // 超過 ±40 度就停車
 
 // 用於扶正回復時的計數器
 unsigned long recovery_counter = 0;
 
-// MPU6050 與 DMP
+// 轉彎的馬達速度
+double turn_speed = 0;
+// MPU6050 與 DMP設定
 MPU6050 mpu;
 bool dmpReady = false;
 uint8_t devStatus;
@@ -26,6 +28,7 @@ uint8_t fifoBuffer[64];
 
 // ISR 所需要的回傳值
 volatile float return_output = 0.0;
+// 紀錄是否完成PID計算
 volatile bool pid_computed = false;
 
 // led 定義
@@ -40,9 +43,9 @@ volatile bool is_fallen = false;
 int current_zone = 0;
 
 // PID
-double input, output, setpoint = -2.3 * DEG_TO_RAD;  // 電源線反方向設定
-// double Kp = 50.0, Ki = 200, Kd = 2.4;   // 角度的
-double Kp = 2350.0, Ki = 11459.0, Kd = 137.4;  // 更改為徑度的
+double input, output, setpoint = -2.3 * DEG_TO_RAD; 
+// double Kp = 50.0, Ki = 200, Kd = 2.4;   // 角度的先留著
+double Kp = 2350.0, Ki = 11459.0, Kd = 137.4;  // 徑度的PID
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 
 // 馬達腳位
@@ -64,36 +67,46 @@ void initMotorPins() {
   pinMode(STBY, OUTPUT);
   digitalWrite(STBY, HIGH);
 }
-
+// 設定馬達輸出為零
 void stop() {
-  setMotorSpeed(0);
+  setMotorSpeed(0,0);
 }
+// 設定馬達輸出,輸入為兩馬達的PWM訊號
+void setMotorSpeed(float speedL, float speedR) {
+  speedL = constrain(speedL, -255, 255);
+  speedR = constrain(speedR, -255, 255);
+  // 設定pwmLR並且消去小角度
+  int pwmL = abs(speedL);
+  int pwmR = abs(speedR);
+  if (pwmL < 10) pwmL = 0;
+  if (pwmR < 10) pwmR = 0;
 
-void setMotorSpeed(float speed) {
-  speed = constrain(speed, -255, 255);
-  int pwm = abs(speed);
-  if (pwm < 5) pwm = 0;
-
-  if (speed < 0) {
+  // 馬達A控制
+  if (speedL < 0) {
     digitalWrite(IN1M, HIGH);
     digitalWrite(IN2M, LOW);
-    digitalWrite(IN3M, HIGH);
-    digitalWrite(IN4M, LOW);
   } else {
     digitalWrite(IN1M, LOW);
     digitalWrite(IN2M, HIGH);
+  }
+  analogWrite(PWMA, pwmL);
+
+  // 馬達B控制
+  if (speedR < 0) {
+    digitalWrite(IN3M, HIGH);
+    digitalWrite(IN4M, LOW);
+  } else {
     digitalWrite(IN3M, LOW);
     digitalWrite(IN4M, HIGH);
   }
-  analogWrite(PWMA, pwm);
-  analogWrite(PWMB, pwm);
+  analogWrite(PWMB, pwmR);
 }
 
 void setup() {
   Serial.begin(9600);  // 配合藍牙
   Wire.begin();
 
-  //加速 I2C 到 400kHz，這是 ISR 讀取不當機的關鍵
+  //加速 I2C 到 400kHz，
   Wire.setClock(400000);
 
   initMotorPins();
@@ -240,6 +253,18 @@ ISR(TIMER2_COMPA_vect) {
 }
 
 void loop() {
+  float speed_L,speed_R;
+  // 讀取監控視窗ads
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    if (cmd == 'a') {
+      turn_speed = 15;  // 設定轉向數值
+    } else if (cmd == 'd') {
+      turn_speed = -15;
+    } else if (cmd == 's') {
+      turn_speed = 0;  // 停止旋轉模式
+    }
+  }
   // 1. 傾倒檢查
   if (is_fallen) {
     stop();
@@ -247,16 +272,19 @@ void loop() {
   // 2. 執行馬達 (只有當 ISR 算好時才動作)
   if (pid_computed) {
     float motor_cmd = return_output;
-    setMotorSpeed(motor_cmd);
+    speed_L = motor_cmd + turn_speed;
+    speed_R = motor_cmd - turn_speed;
+    setMotorSpeed(speed_L,speed_R);
     pid_computed = false;
   }
 
   // 3. 序列埠列印 (傳給 MATLAB)
   static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 20) {
+  if (millis() - lastPrint > 200) {
     lastPrint = millis();
     Serial.print(currentDMPAngle, 2);
     Serial.print(",");
-    Serial.println(return_output);
+    Serial.print(speed_R);
+    Serial.println(speed_L);
   }
 }
