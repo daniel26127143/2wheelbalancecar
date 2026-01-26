@@ -5,6 +5,10 @@
 // 徑度角度的轉換常數
 //const float DEG_TO_RAD = 0.0174533f; // (PI / 180.0) 因為原本就有定義了 重新定義會出錯先註解
 
+// 移動與轉向參數
+float PWM_MOVE_SPEED = 20.0;   // 前進後退
+float PWM_TURN_SPEED = 15.0;   // 左右轉向
+
 // 分區 PWM 設定
 float zone1_limit = 2 * DEG_TO_RAD;        // |input| < 2
 float zone2_limit = 3 * DEG_TO_RAD;        // |input| < 3
@@ -18,6 +22,12 @@ unsigned long recovery_counter = 0;
 
 // 轉彎的馬達速度
 double turn_speed = 0;
+// 轉向控制變數
+volatile float currentYaw = 0.0;  // 目前的航向角 (度)
+float targetYaw = 0.0;            // 目標航向角 (度)
+bool isAutoTurning = false;       // 是否正在自動轉彎
+double turn_cmd_pwm = 0;          // 計算出來的轉向 PWM
+
 // MPU6050 與 DMP設定
 MPU6050 mpu;
 bool dmpReady = false;
@@ -28,25 +38,24 @@ uint8_t fifoBuffer[64];
 
 // ISR 所需要的回傳值
 volatile float return_output = 0.0;
-// 紀錄是否完成PID計算
-volatile bool pid_computed = false;
-
-// led 定義
-const int led = A0;
-Quaternion q;
-VectorFloat gravity;
-float ypr[3];
 
 // 用於ISR和Loop中傳遞當前的角度和小車已倒下旗標
 volatile float currentDMPAngle = 0.0;
 volatile bool is_fallen = false;
 int current_zone = 0;
+unsigned long moveStartTime = 0;  // 動作開始的時間
+bool isAutoMoving = false;        // 是否正在自動移動中
+const int MOVE_DURATION = 10000;  // 移動時間 (毫秒)，這裡設 1 秒
+// 紀錄是否完成PID計算
+volatile bool pid_computed = false;
 
 // PID
-double input, output, setpoint = -2.3 * DEG_TO_RAD; 
-// double Kp = 50.0, Ki = 200, Kd = 2.4;   // 角度的先留著
-double Kp = 2350.0, Ki = 11459.0, Kd = 137.4;  // 徑度的PID
+double input, output, setpoint = -2.69 * DEG_TO_RAD, BALANCE_POINT = -2.3 * DEG_TO_RAD;
+double Kp = 2500.0, Ki = 10000.0, Kd = 100.0;  // 徑度的PID
 PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
+Quaternion q;
+VectorFloat gravity;
+float ypr[3];
 
 // 馬達腳位
 #define IN1M 7
@@ -56,6 +65,8 @@ PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
 #define IN4M 12
 #define PWMB 10
 #define STBY 8
+// led 定義
+const int led = A0;
 
 void initMotorPins() {
   pinMode(IN1M, OUTPUT);
@@ -69,7 +80,7 @@ void initMotorPins() {
 }
 // 設定馬達輸出為零
 void stop() {
-  setMotorSpeed(0,0);
+  setMotorSpeed(0, 0);
 }
 // 設定馬達輸出,輸入為兩馬達的PWM訊號
 void setMotorSpeed(float speedL, float speedR) {
@@ -253,38 +264,74 @@ ISR(TIMER2_COMPA_vect) {
 }
 
 void loop() {
-  float speed_L,speed_R;
-  // 讀取監控視窗ads
+  static float speed_L = 0;
+  static float speed_R = 0;
+  // 移動目標 (預設為 0)
+  static float move_pwm_target = 0;
+  static float turn_pwm_target = 0;
+
+  // 1. 讀取指令
   if (Serial.available()) {
     char cmd = Serial.read();
-    if (cmd == 'a') {
-      turn_speed = 15;  // 設定轉向數值
-    } else if (cmd == 'd') {
-      turn_speed = -15;
-    } else if (cmd == 's') {
-      turn_speed = 0;  // 停止旋轉模式
+
+    // --- 前進/後退 ---
+    if (cmd == 'w') {
+      move_pwm_target = PWM_MOVE_SPEED;  // 使用變數 (正)
+      Serial.println("Move: Forward");
+    } else if (cmd == 'x') {
+      move_pwm_target = -PWM_MOVE_SPEED;  // 使用變數 (負)
+      Serial.println("Move: Backward");
     }
+
+    // --- 左轉/右轉 ---
+    else if (cmd == 'a') {
+      turn_pwm_target = PWM_TURN_SPEED;  // 使用變數
+      Serial.println("Turn: Left");
+    } else if (cmd == 'd') {
+      turn_pwm_target = -PWM_TURN_SPEED;  // 使用變數 (負)
+      Serial.println("Turn: Right");
+    }
+
+    // --- 停止 ---
+    else if (cmd == 's') {
+      move_pwm_target = 0;
+      turn_pwm_target = 0;
+      Serial.println("Stop");
+    }
+  }
+
+  // 自動回復平衡setpoint
+  if (isAutoMoving && (millis() - moveStartTime > MOVE_DURATION)) {
+
+    setpoint = BALANCE_POINT;
+    isAutoMoving = false;
+    Serial.println("Auto Stop (Time's up)");
   }
   // 1. 傾倒檢查
   if (is_fallen) {
     stop();
+    isAutoMoving = false;
   }
   // 2. 執行馬達 (只有當 ISR 算好時才動作)
   if (pid_computed) {
     float motor_cmd = return_output;
     speed_L = motor_cmd + turn_speed;
     speed_R = motor_cmd - turn_speed;
-    setMotorSpeed(speed_L,speed_R);
+    setMotorSpeed(speed_L, speed_R);
     pid_computed = false;
   }
 
-  // 3. 序列埠列印 (傳給 MATLAB)
+  //輸出matlab
   static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 200) {
+  if (millis() - lastPrint > 50) {
     lastPrint = millis();
-    Serial.print(currentDMPAngle, 2);
+    // 格式：時間, 角度, PID輸出, 左輪PWM
+    Serial.print(millis());
     Serial.print(",");
-    Serial.print(speed_R);
+    Serial.print(currentDMPAngle * 180.0 / 3.14159, 2);
+    Serial.print(",");
+    Serial.print(return_output);
+    Serial.print(",");
     Serial.println(speed_L);
   }
 }
