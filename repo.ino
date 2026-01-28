@@ -1,7 +1,7 @@
 #include <Wire.h>
 #include "I2Cdev.h"
 #include "MPU6050_6Axis_MotionApps20.h"
-#include <PID_v1.h>
+// #include <PID_v1.h>
 // 徑度角度的轉換常數
 //const float DEG_TO_RAD = 0.0174533f; // (PI / 180.0) 因為原本就有定義了 重新定義會出錯先註解
 
@@ -50,9 +50,12 @@ const int MOVE_DURATION = 10000;  // 移動時間 (毫秒)，這裡設 1 秒
 volatile bool pid_computed = false;
 
 // PID
-double input, output, setpoint = -2.69 * DEG_TO_RAD, BALANCE_POINT = -2.3 * DEG_TO_RAD;
-double Kp = 2500.0, Ki = 10000.0, Kd = 100.0;  // 徑度的PID
-PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
+double input, output, setpoint = -2.69 * DEG_TO_RAD;
+double Kp = 2500.0, Ki = 100.0, Kd = 10000.0;  // 徑度的PID
+// PID pid(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
+float error = 0;       // 用於計算當前離平衡點的誤差值(P)
+float last_error = 0;  // 上一次的誤差 (D)
+float integral = 0;    // 累積的誤差 (I)
 Quaternion q;
 VectorFloat gravity;
 float ypr[3];
@@ -78,10 +81,12 @@ void initMotorPins() {
   pinMode(STBY, OUTPUT);
   digitalWrite(STBY, HIGH);
 }
+
 // 設定馬達輸出為零
 void stop() {
   setMotorSpeed(0, 0);
 }
+
 // 設定馬達輸出,輸入為兩馬達的PWM訊號
 void setMotorSpeed(float speedL, float speedR) {
   speedL = constrain(speedL, -255, 255);
@@ -111,6 +116,32 @@ void setMotorSpeed(float speedL, float speedR) {
     digitalWrite(IN4M, HIGH);
   }
   analogWrite(PWMB, pwmR);
+}
+
+float Lite_PID(float input, float setpoint) {
+  // 計算(P)
+  error = setpoint - input;
+
+  // 算(I)
+  // 這邊怪怪的
+  if (abs(error) < (3 * DEG_TO_RAD)) {
+    integral += error;
+    integral = constrain(integral, -1.5, 1.5); // 防呆：抗積分飽和
+  } else {
+    integral = 0; // 角度太大時，清除積分
+  }
+
+  // 算(D)
+  float derivative = error - last_error;
+
+  // 計算PID output值
+  float LPID_output = (Kp * error) + (Ki * integral) + (Kd * derivative);
+
+  // 紀錄兩次的error之間
+  last_error = error;
+  
+  // 限制輸出範圍
+  return constrain(LPID_output, -255, 255);
 }
 
 void setup() {
@@ -145,10 +176,6 @@ void setup() {
     while (1)
       ;
   }
-
-  pid.SetMode(AUTOMATIC);
-  pid.SetOutputLimits(-255, 255);
-  pid.SetSampleTime(10);
 
   // TIMER2設定
   cli();
@@ -217,7 +244,7 @@ ISR(TIMER2_COMPA_vect) {
     }
     // 計算PID並且使用分區增益
     else {
-      pid.Compute();
+      output = Lite_PID(input,setpoint);
       // 分區增益邏輯
       current_zone = 0;
       if (abs(input) < zone1_limit) {
@@ -246,10 +273,6 @@ ISR(TIMER2_COMPA_vect) {
       if (recovery_counter >= 100) {
         is_fallen = false;     // 取消傾倒狀態
         recovery_counter = 0;  // 回復計數器歸零
-
-        // 重置 PID 積分項 (避免暴衝)
-        pid.SetMode(MANUAL);
-        pid.SetMode(AUTOMATIC);
       }
     } else {
       //recovery_counter = 0;
@@ -298,14 +321,6 @@ void loop() {
       turn_pwm_target = 0;
       Serial.println("Stop");
     }
-  }
-
-  // 自動回復平衡setpoint
-  if (isAutoMoving && (millis() - moveStartTime > MOVE_DURATION)) {
-
-    setpoint = BALANCE_POINT;
-    isAutoMoving = false;
-    Serial.println("Auto Stop (Time's up)");
   }
   // 1. 傾倒檢查
   if (is_fallen) {
