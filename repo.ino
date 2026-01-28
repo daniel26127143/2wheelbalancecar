@@ -121,25 +121,19 @@ void setMotorSpeed(float speedL, float speedR) {
 float Lite_PID(float input, float setpoint) {
   // 計算(P)
   error = setpoint - input;
-
   // 算(I)
-  // 這邊怪怪的
   if (abs(error) < (3 * DEG_TO_RAD)) {
     integral += error;
-    integral = constrain(integral, -1.5, 1.5); // 防呆：抗積分飽和
+    integral = constrain(integral, -1.5, 1.5);
   } else {
     integral = 0; // 角度太大時，清除積分
   }
-
   // 算(D)
   float derivative = error - last_error;
-
   // 計算PID output值
   float LPID_output = (Kp * error) + (Ki * integral) + (Kd * derivative);
-
   // 紀錄兩次的error之間
   last_error = error;
-  
   // 限制輸出範圍
   return constrain(LPID_output, -255, 255);
 }
