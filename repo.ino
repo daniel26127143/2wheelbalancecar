@@ -204,14 +204,22 @@ float Lite_PID(float input, float adj_setpoint) {
   // 限制輸出範圍
   return constrain(Roll_PID_output, -255, 255);
 }
-// 左輪中斷encoder
+// 左輪中斷encoder 
 void Code_left() {
-  encoder_count_L++;
+  if (digitalRead(IN2M) == HIGH) {
+    encoder_count_L++;  // 前進時加
+  } else {
+    encoder_count_L--;  // 後退時減
+  }
 }
 
-// 右輪中斷encoder
+// 右輪中斷encoder 
 void Code_right() {
-  encoder_count_R++;
+  if (digitalRead(IN4M) == HIGH) {
+    encoder_count_R++;  // 前進時加
+  } else {
+    encoder_count_R--;  // 後退時減
+  }
 }
 
 float Speed_PI() {
@@ -222,6 +230,11 @@ float Speed_PI() {
 
   // 對速度進行一階低通濾波
   filtered_speed = filtered_speed * 0.7 + current_speed * 0.3;
+
+  if (!is_navigating) {
+    Speed_integral = 0;
+    return 0.0;  // 當不再巡航模式下直接回傳0
+  }
 
   // 計算 PI 誤差與積分
   float Speed_error = target_speed - filtered_speed;
@@ -235,7 +248,7 @@ float Speed_PI() {
 
   // 將輸出轉換為角度量級，並限制最大傾角 (限幅在 ±4 度內)
   speed_output = speed_output * 0.001;
-  speed_output = constrain(speed_output, -4.0 * DEG_TO_RAD, 4.0 * DEG_TO_RAD);
+  speed_output = constrain(speed_output, -2.0 * DEG_TO_RAD, 2.0 * DEG_TO_RAD);
 
   return speed_output;
 }
@@ -386,11 +399,11 @@ void loop() {
 
     if (cmd == 'W' || cmd == 'w') {
       is_navigating = true;
-      target_speed = 30.0;  // 設定目標速度為正 (前進)
+      target_speed = 5.0;  // 設定目標速度為正 (前進)
       Serial.println("前進");
     } else if (cmd == 'x' || cmd == 'x') {
       is_navigating = true;
-      target_speed = -30.0;  // 設定目標速度為負 (後退)
+      target_speed = -5.0;  // 設定目標速度為負 (後退)
       Serial.println("後退");
     } else if (cmd == 'S' || cmd == 's') {
       is_navigating = false;
@@ -432,7 +445,14 @@ void loop() {
     setMotorSpeed(speed_L, speed_R);
     pid_computed = false;  // 等待下一次中斷
   }
+  // static unsigned long lastPrint = 0;
+  // if (millis() - lastPrint > 200) {  // 縮短到 50ms 抓一次資料，波形更細膩
+  //   lastPrint = millis();
 
+  //   Serial.print(millis());
+  //   Serial.print(",");
+  //   Serial.println(adj_setpoint * RAD_TO_DEG, 2);  // 變數 1: 當前傾斜角度
+  // }
   //輸出matlab
   // static unsigned long lastPrint = 0;
   // if (millis() - lastPrint > 200) {
@@ -463,19 +483,19 @@ void loop() {
   //   Serial.print(" | 真實速:"); Serial.print(filtered_speed);
   //   Serial.print(" | 補償角:"); Serial.println((base_setpoint - adj_setpoint) * RAD_TO_DEG, 2);
   // }
-
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 50) {  // 縮短到 50ms 抓一次資料，波形更細膩
+static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 200) {  
     lastPrint = millis();
     
+    // 輸出格式: 時間, 目標角度, 真實角度, 目標速度, 真實速度
     Serial.print(millis());
     Serial.print(",");
-    Serial.print(currentDMPAngle * RAD_TO_DEG, 2);  // 變數 1: 當前傾斜角度
+    Serial.print(adj_setpoint * RAD_TO_DEG, 2);      // 指標 1: 大腦給的「目標傾角」
     Serial.print(",");
-    Serial.print(return_output);                    // 變數 2: 馬達實際推力 (PID輸出 PWM)
+    Serial.print(currentDMPAngle * RAD_TO_DEG, 2);   // 指標 2: 小腦量到的「真實傾角」
     Serial.print(",");
-    Serial.print(filtered_speed);                   // 變數 3: Encoder 讀到的真實車速
+    Serial.print(target_speed);                      // 指標 3: 長官下的「目標速度」
     Serial.print(",");
-    Serial.println((base_setpoint - adj_setpoint) * RAD_TO_DEG, 2); // 變數 4: 大腦給的角度補償
+    Serial.println(filtered_speed);                  // 指標 4: Encoder 算出的「真實速度」
   }
 }
