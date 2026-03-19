@@ -3,7 +3,10 @@
 #include "MPU6050_6Axis_MotionApps20.h"
 #include <PinChangeInterrupt.h>
 
-
+//隨時可刪掉
+volatile float out_P = 0.0;
+volatile float out_I = 0.0;
+volatile float out_D = 0.0;
 // ★★★ 硬體腳位定義 ★★★
 // 馬達腳位
 #define IN1M 7
@@ -24,13 +27,14 @@ const int led = A0;
 
 // ★★★ 系統常數和PID參數 ★★★
 // Setpoint
-float input, output, base_setpoint = -0.8 * DEG_TO_RAD, adj_setpoint = base_setpoint;
+float input, output, base_setpoint = -1.7 * DEG_TO_RAD, adj_setpoint = base_setpoint;
 // Roll
-float Roll_Kp_Small = 2500.0, Roll_Ki_Small = 100.0, Roll_Kd_Small = 10000.0;  // ROLL誤差小
-float Roll_Kp_Mid = 3000.0, Roll_Ki_Mid = 50.0, Roll_Kd_Mid = 10500.0;         // 誤差中
-float Roll_Kp_Large = 3500.0, Roll_Ki_Large = 0.0, Roll_Kd_Large = 11000.0;    // 誤差大
-float limit_small = 1.0 * DEG_TO_RAD;                                          // 誤差 < 2 度，使用 Small
-float limit_mid = 3.0 * DEG_TO_RAD;                                            // 誤差 < 3 度，使用 Mid
+// float Roll_Kp_Small = 2500.0, Roll_Ki_Small = 100.0, Roll_Kd_Small = 10000.0;  // ROLL誤差小
+float Roll_Kp_Small = 2700.0, Roll_Ki_Small = 165.0, Roll_Kd_Small = 10000.0;  // ROLL誤差小
+float Roll_Kp_Mid = 3500.0, Roll_Ki_Mid = 0.0, Roll_Kd_Mid = 11000.0;                         // 誤差中
+float Roll_Kp_Large = 4000.0, Roll_Ki_Large = 0.0, Roll_Kd_Large = 13000.0;    // 誤差大
+float limit_small = 2.0 * DEG_TO_RAD;                                          // 誤差 < 2 度，使用 Small
+float limit_mid = 4.0 * DEG_TO_RAD;                                            // 誤差 < 3 度，使用 Mid
 float Roll_Kp_Move = 2500.0, Roll_Ki_Move = 0.0, Roll_Kd_Move = 10000.0;       // 移動時Roll徑度的PID                                                                                                                              // 前後移動時的PWM加值
 // Pitch
 float Pitch_Kp_Small = 0.0, Pitch_Ki_Small = 0.0, Pitch_Kd_Small = 0.0;  // Pitch徑度的PID
@@ -167,7 +171,7 @@ float Lite_PID(float input, float adj_setpoint) {
   // 計(P)
   Roll_error = adj_setpoint - input;
   // 算(I)
-  if (abs(Roll_error) < (3 * DEG_TO_RAD)) {
+  if (abs(Roll_error) < (2 * DEG_TO_RAD)) {
     Roll_integral += Roll_error;
   } else {
     Roll_integral = 0;  // 角度太大時，清除積分
@@ -474,58 +478,5 @@ void loop() {
 
     setMotorSpeed(speed_L, speed_R);
     pid_computed = false;  // 等待下一次中斷
-  }
-  // static unsigned long lastPrint = 0;
-  // if (millis() - lastPrint > 200) {  // 縮短到 50ms 抓一次資料，波形更細膩
-  //   lastPrint = millis();
-
-  //   Serial.print(millis());
-  //   Serial.print(",");
-  //   Serial.println(adj_setpoint * RAD_TO_DEG, 2);  // 變數 1: 當前傾斜角度
-  // }
-  //輸出matlab
-  // static unsigned long lastPrint = 0;
-  // if (millis() - lastPrint > 200) {
-  //   lastPrint = millis();
-  //   // 格式：時間, 角度, PID輸出, 左輪PWM
-  //   Serial.print(millis());
-  //   Serial.print(",ROLL角 : ");
-  //   Serial.print(currentDMPAngle * 180.0 / 3.14159, 2);
-  //   Serial.print(",YAW角 : ");
-  //   Serial.print(currentYaw * 180.0 / 3.14159, 2);
-  //   Serial.print(",eL : ");
-  //   Serial.print(encoder_count_L);
-  //   Serial.print(",eR : ");
-  //   Serial.print(encoder_count_R);
-  //   if (is_navigating) {
-  //     Serial.print(",模式 : 自動巡航");
-  //   } else {
-  //     Serial.print(",模式 : 平衡模式");
-  //   }
-  //   Serial.println(return_output);
-
-  // }
-  // static unsigned long lastPrint = 0;
-  // if (millis() - lastPrint > 200) {
-  //   lastPrint = millis();
-  //   Serial.print("ROLL角:"); Serial.print(currentDMPAngle * RAD_TO_DEG, 2);
-  //   Serial.print(" | 目標速:"); Serial.print(target_speed);
-  //   Serial.print(" | 真實速:"); Serial.print(filtered_speed);
-  //   Serial.print(" | 補償角:"); Serial.println((base_setpoint - adj_setpoint) * RAD_TO_DEG, 2);
-  // }
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 200) {
-    lastPrint = millis();
-
-    // 輸出格式: 時間, 目標角度, 真實角度, 目標速度, 真實速度
-    Serial.print(millis());
-    Serial.print(",");
-    Serial.print(adj_setpoint * RAD_TO_DEG, 2);  // 指標 1: 大腦給的「目標傾角」
-    Serial.print(",");
-    Serial.print(currentDMPAngle * RAD_TO_DEG, 2);  // 指標 2: 小腦量到的「真實傾角」
-    Serial.print(",");
-    Serial.print(target_speed);  // 指標 3: 長官下的「目標速度」
-    Serial.print(",");
-    Serial.println(filtered_speed);  // 指標 4: Encoder 算出的「真實速度」
   }
 }
