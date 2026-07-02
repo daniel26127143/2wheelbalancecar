@@ -27,7 +27,8 @@ const int led = A0;
 
 // ★★★ 系統常數和PID參數 ★★★
 // Setpoint
-float input, output, base_setpoint = -1.5 * DEG_TO_RAD, adj_setpoint = base_setpoint;
+float input, output, base_setpoint = -1.5 * DEG_TO_RAD;
+volatile float adj_setpoint = base_setpoint;
 //69.8
 // Roll
 // float Roll_Kp_Small = 2500.0, Roll_Ki_Small = 100.0, Roll_Kd_Small = 10000.0;  // ROLL誤差小
@@ -56,6 +57,15 @@ float fall_angle_limit = 40 * DEG_TO_RAD;  // 超過 ±40 度就停車
 
 
 // ★★★ 全域變數 ★★★
+
+// 移動可調參數
+float move_lean_angle = -0.65 * DEG_TO_RAD;  // 巡航時的傾角（統一命名，方便之後調整）
+float decel_fraction = 0.0;                // 最後 35% 的距離開始減速，可依測試調整
+
+// 核心監控變數
+volatile unsigned long overlap_count = 0;       // 記錄總共發生幾次重疊衝突
+volatile unsigned long isr_execution_time = 0;  // 記錄中斷核心計算花了幾秒
+
 // MPU6050 與 DMP設定
 MPU6050 mpu;
 bool dmpReady = false;
@@ -94,11 +104,21 @@ float filtered_speed = 0.0;  // 濾波後的真實車速
 float targetYaw = 0.0;       // 目標航向角 (度)
 bool isAutoTurning = false;  // 是否正在自動轉彎
 float turn_cmd_pwm = 0;      // 計算出來的轉向 PWM
-float speed_L, speed_R;
+volatile float speed_L, speed_R;
 
 // Encoder 計數變數
 volatile long encoder_count_L = 0;
 volatile long encoder_count_R = 0;
+
+
+// 狀態變數
+volatile float turn_req = 0.0;
+long start_pos = 0;
+long target_ticks = 0;
+volatile float target_angle_offset = 0.0;
+volatile float current_angle_offset = 0.0;
+float transition_speed = 0.02 * DEG_TO_RAD;
+unsigned long wait_timer = 0;
 
 void initMotorPins() {
   pinMode(IN1M, OUTPUT);
@@ -320,7 +340,7 @@ void setup() {
   TCCR2A = 0;
   TCCR2B = 0;
   TCNT2 = 0;
-  OCR2A = 124;
+  OCR2A = 148;
   TCCR2A |= (1 << WGM21);
   TCCR2B |= (1 << CS22);
   TIMSK2 |= (1 << OCIE2A);
@@ -333,20 +353,29 @@ ISR(TIMER2_COMPA_vect) {
   count++;
 
   // 檢查是否到中斷時間
-  if (count < 10) {
+  if (count < 6) {
     return;
   }
   count = 0;
+  static volatile bool busy_flag = false;
+
+  if (busy_flag) {
+    overlap_count++;  // 如果發現上鎖了，重疊次數 +1
+    return;
+  }
+  busy_flag = true;  // 進入計算，立刻上鎖！
 
   // 以下進入真正的中斷
   sei();
   digitalWrite(led, HIGH);
-
+  unsigned long startTime = micros();
   // 讀取 FIFO
   fifoCount = mpu.getFIFOCount();
   if (fifoCount == 1024) {
     mpu.resetFIFO();
     digitalWrite(led, LOW);
+    isr_execution_time = micros() - startTime;
+    busy_flag = false;
     return;
   }
 
@@ -361,6 +390,8 @@ ISR(TIMER2_COMPA_vect) {
     input = currentDMPAngle;
   } else {
     digitalWrite(led, LOW);
+    isr_execution_time = micros() - startTime;
+    busy_flag = false;
     return;
   }
 
@@ -395,11 +426,33 @@ ISR(TIMER2_COMPA_vect) {
       //recovery_counter = 0;
     }
   }
+  // 平滑的重心轉移
+  // 計算目前角度與目標角度的差距
+  float error = target_angle_offset - current_angle_offset;
 
+  // 如果差距大於一步的距離，就往目標跨一步
+  if (abs(error) > transition_speed) {
+    // 判斷方向：如果目標在正前方就加，在後面就減
+    if (error > 0) current_angle_offset += transition_speed;
+    else current_angle_offset -= transition_speed;
+  }
+  // 如果差距已經小於一步的距離，直接貼齊目標，防止超過
+  else {
+    current_angle_offset = target_angle_offset;
+  }
+  adj_setpoint = base_setpoint + current_angle_offset;
+
+  // 最後輸出給馬達
+  float motor_cmd = return_output;
+  speed_L = motor_cmd + turn_req;
+  speed_R = motor_cmd - turn_req;
+
+  setMotorSpeed(speed_L, speed_R);
   // ==========================================================
-
+  isr_execution_time = micros() - startTime;
   // 放置PID計算完成旗標，告訴Loop可以正常工作
   pid_computed = true;
+  busy_flag = false;
   digitalWrite(led, LOW);
 }
 
@@ -412,27 +465,18 @@ enum NavState { IDLE,
 NavState nav_state = IDLE;
 
 // 定義座標 (X, Y)
-float waypoints[3][2] = {
+float waypoints[2][2] = {
   { 0.0, 0.0 },  // 起點
-  { 3.0, 0.0 },  //
-  { 0.0, 3.0 }   //
+  { 1.0, 0.0 }   //
 };
 int current_wp = 1;
-int total_wps = 3;
+int total_wps = 2;
 
 float UNIT_TO_CM = 10.0;
 float current_X = 0.0;   // 絕對 X 座標
 float current_Y = 0.0;   // 絕對 Y 座標
 long last_odom_pos = 0;  // 紀錄上一次計算時的輪胎位置
 
-// 狀態變數
-float turn_req = 0.0;
-long start_pos = 0;
-long target_ticks = 0;
-float target_angle_offset = 0.0;
-float current_angle_offset = 0.0;
-float transition_speed = 0.01 * DEG_TO_RAD;
-unsigned long wait_timer = 0;
 
 // 處理導航模式
 void processCommand() {
@@ -451,10 +495,10 @@ void processCommand() {
     } else if (cmd == 'W' || cmd == 'w') {
       is_navigating = true;
       nav_state = MOVING;
-      target_angle_offset = -0.5 * DEG_TO_RAD;
-      target_ticks = 809;
+      target_angle_offset = move_lean_angle;
+      target_ticks = 243;
       start_pos = (encoder_count_L + encoder_count_R) / 2;
-      Serial.println("前進 50cm");
+      Serial.println("前進 15cm");
     } else if (cmd == 'S' || cmd == 's') {
       nav_state = IDLE;
       is_navigating = false;
@@ -509,106 +553,88 @@ void goNavigation() {
     if (abs(yaw_error) < (3.0 * DEG_TO_RAD)) {
       turn_req = 0.0;
       start_pos = (encoder_count_L + encoder_count_R) / 2;
-      target_angle_offset = -0.5 * DEG_TO_RAD;
+      target_angle_offset = move_lean_angle;
       nav_state = MOVING;
       Serial.println("開始直行...");
     }
   } else if (nav_state == MOVING) {
     long current_pos = (encoder_count_L + encoder_count_R) / 2;
     long moved_distance = current_pos - start_pos;
-
+    long remaining_ticks = target_ticks - moved_distance;
+    long decel_start_ticks = target_ticks * decel_fraction;
 
     turn_req = 0.0;
 
-    if (moved_distance >= target_ticks) {
+    if (remaining_ticks <= 0) {
+      // 抵達終點
       target_angle_offset = 0.0;
       turn_req = 0.0;
       Serial.println("抵達");
       wait_timer = millis();
       nav_state = WAIT;
-    }
-  } else if (nav_state == WAIT) {
-    if (millis() - wait_timer > 1500) {
-      current_wp++;
-      if (current_wp < total_wps) {
-        nav_state = CALC_PATH;
-      } else {
-        nav_state = IDLE;
-        is_navigating = false;
-        Serial.println("完成");
-      }
-    }
-  }
-}
-
-void executeBalance() {
-  // 平滑的重心轉移
-  if (current_angle_offset < target_angle_offset) {
-    current_angle_offset += transition_speed;
-    if (current_angle_offset > target_angle_offset) current_angle_offset = target_angle_offset;
-  } else if (current_angle_offset > target_angle_offset) {
-    current_angle_offset -= transition_speed;
-    if (current_angle_offset < target_angle_offset) current_angle_offset = target_angle_offset;
-  }
-
-  adj_setpoint = base_setpoint + current_angle_offset;
-
-  // 最後輸出給馬達
-  float motor_cmd = return_output;
-  speed_L = motor_cmd + turn_req;
-  speed_R = motor_cmd - turn_req;
-
-  setMotorSpeed(speed_L, speed_R);
-  pid_computed = false;
-}
-
-void printInfo() {
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 100) {
-    lastPrint = millis();
-
-    // 輸出即時的XY跟角度
-    Serial.print("X: ");
-    Serial.print(current_Y, 2);
-    Serial.print(" | Y: ");
-    Serial.print(current_X, 2);
-    Serial.print(" | 角度: ");
-    Serial.print(currentDMPAngle * RAD_TO_DEG, 1);
-    //
-    // 輸出剩餘距離
-    if (is_navigating && nav_state == MOVING) {
-      long current_pos = (encoder_count_L + encoder_count_R) / 2;
-      long moved_distance = current_pos - start_pos;
-      long remaining_ticks = abs(target_ticks) - abs(moved_distance);
-
-      float remaining_cm = remaining_ticks / 16.18;
-      if (remaining_cm < 0) remaining_cm = 0;
-
-      Serial.print(" | 和目標還差: ");
-      Serial.print(remaining_cm, 1);
-      Serial.println(" cm");
+    } else if (decel_start_ticks > 0 && remaining_ticks < decel_start_ticks) {
+      // 減速區：傾角隨剩餘距離線性收斂到 0
+      float decel_ratio = (float)remaining_ticks / decel_start_ticks;
+      decel_ratio = constrain(decel_ratio, 0.15, 1.0);  // 保留最低15%動力，避免還沒到就停下不動
+      target_angle_offset = move_lean_angle * decel_ratio;
     } else {
-      // 換行結尾
-      Serial.println();
+      // 巡航區：維持固定傾角
+      target_angle_offset = move_lean_angle;
     }
   }
 }
-// matlab所使用的
+
+// void executeBalance() {
+//   pid_computed = false;
+// }
+
 // void printInfo() {
 //   static unsigned long lastPrint = 0;
 //   if (millis() - lastPrint > 100) {
 //     lastPrint = millis();
 
-//     // 格式固定為：時間,目前角度,PID原力,最終左輪PWM
-//     Serial.print(millis());
-//     Serial.print(",");
-//     Serial.print(currentDMPAngle * RAD_TO_DEG, 2);
-//     Serial.print(",");
-//     Serial.print(return_output, 2);
-//     Serial.print(",");
-//     Serial.println(speed_L, 2);
+//     // 輸出即時的XY跟角度
+//     Serial.print("X: ");
+//     Serial.print(current_Y, 2);
+//     Serial.print(" | Y: ");
+//     Serial.print(current_X, 2);
+//     Serial.print(" | 角度: ");
+//     Serial.print(currentDMPAngle * RAD_TO_DEG, 1);
+//     //
+//     // 輸出剩餘距離
+//     if (is_navigating && nav_state == MOVING) {
+//       long current_pos = (encoder_count_L + encoder_count_R) / 2;
+//       long moved_distance = current_pos - start_pos;
+//       long remaining_ticks = abs(target_ticks) - abs(moved_distance);
+
+//       float remaining_cm = remaining_ticks / 16.18;
+//       if (remaining_cm < 0) remaining_cm = 0;
+
+//       Serial.print(" | 和目標還差: ");
+//       Serial.print(remaining_cm, 1);
+//       Serial.println(" cm");
+//     } else {
+//       // 換行結尾
+//       Serial.println();
+//     }
 //   }
 // }
+// matlab所使用的
+void printInfo() {
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 100) {
+    lastPrint = millis();
+
+    // 格式固定為：時間,目前角度,PID原力,最終左輪PWM
+    Serial.print(millis());
+    Serial.print(",");
+    Serial.print(currentDMPAngle * RAD_TO_DEG, 2);
+    Serial.print(",");
+    Serial.print(return_output, 2);
+    Serial.print(",");
+    Serial.println(speed_L, 2);
+  }
+}
 
 void updateOdometry() {
   long current_pos = (encoder_count_L + encoder_count_R) / 2;
@@ -635,8 +661,8 @@ void loop() {
   // 當PID計算完成後判斷有無傾倒才開始計算
   if (pid_computed && !is_fallen) {
     updateOdometry();
-    goNavigation();    // 指令
-    executeBalance();  // 重心轉移
+    goNavigation();  // 指令
+    pid_computed = false;
   }
 
   printInfo();  // 輸出數據
