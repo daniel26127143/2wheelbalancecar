@@ -27,17 +27,17 @@ const int led = A0;
 
 // ★★★ 系統常數和PID參數 ★★★
 // Setpoint
-float input, output, base_setpoint = -1.5 * DEG_TO_RAD;
+float input, output, base_setpoint = 0 * DEG_TO_RAD;
 volatile float adj_setpoint = base_setpoint;
 //69.8
 // Roll
 // float Roll_Kp_Small = 2500.0, Roll_Ki_Small = 100.0, Roll_Kd_Small = 10000.0;  // ROLL誤差小
-float Roll_Kp_Small = 2700.0, Roll_Ki_Small = 165.0, Roll_Kd_Small = 9000.0;  // ROLL誤差小
-float Roll_Kp_Mid = 3500.0, Roll_Ki_Mid = 0.0, Roll_Kd_Mid = 10500.0;         // 誤差中
-float Roll_Kp_Large = 4000.0, Roll_Ki_Large = 0.0, Roll_Kd_Large = 12500.0;   // 誤差大
+float Roll_Kp_Small = 2700.0, Roll_Ki_Small = 165.0, Roll_Kd_Small = 53.0;  // ROLL誤差小
+float Roll_Kp_Mid = 3500.0, Roll_Ki_Mid = 0.0, Roll_Kd_Mid = 63.0;          // 誤差中
+float Roll_Kp_Large = 4000.0, Roll_Ki_Large = 0.0, Roll_Kd_Large = 75.0;    // 誤差大
 float limit_small = 2.0 * DEG_TO_RAD;
 float limit_mid = 4.0 * DEG_TO_RAD;
-float Roll_Kp_Move = 2700.0, Roll_Ki_Move = 165.0, Roll_Kd_Move = 10000.0;  // 移動時Roll徑度的PID                                                                                                                              // 前後移動時的PWM加值
+float Roll_Kp_Move = 2700.0, Roll_Ki_Move = 165.0, Roll_Kd_Move = 53.0;  // 移動時Roll徑度的PID                                                                                                                              // 前後移動時的PWM加值
 // Pitch
 float Pitch_Kp_Small = 0.0, Pitch_Ki_Small = 0.0, Pitch_Kd_Small = 0.0;  // Pitch徑度的PID
 // Yaw
@@ -60,7 +60,7 @@ float fall_angle_limit = 40 * DEG_TO_RAD;  // 超過 ±40 度就停車
 
 // 移動可調參數
 float move_lean_angle = -0.65 * DEG_TO_RAD;  // 巡航時的傾角（統一命名，方便之後調整）
-float decel_fraction = 0.0;                // 最後 35% 的距離開始減速，可依測試調整
+float decel_fraction = 0.0;                  // 最後 35% 的距離開始減速，可依測試調整
 
 // 核心監控變數
 volatile unsigned long overlap_count = 0;       // 記錄總共發生幾次重疊衝突
@@ -187,7 +187,7 @@ void calculate_Target_Yaw_Angle(float x, float y) {
   float display_deg = target_rad / DEG_TO_RAD;
 }
 
-float Lite_PID(float input, float adj_setpoint) {
+float Lite_PID(float input, float adj_setpoint, float gyro_rate) {
   float Roll_PID_output = 0.0;
   // ======== ROLL =======
   // 計(P)
@@ -195,12 +195,13 @@ float Lite_PID(float input, float adj_setpoint) {
   // 算(I)
   if (abs(Roll_error) < limit_small) {
     Roll_integral += Roll_error;
-    Roll_integral = constrain(Roll_integral, -0.5, 0.5);
+    Roll_integral = constrain(Roll_integral, -0.1, 0.1);
   } else {
     Roll_integral = Roll_integral * 0.9;
   }
   // 算(D)
-  Roll_derivative = Roll_error - Roll_last_error;
+  // Roll_derivative = Roll_error - Roll_last_error;
+  Roll_derivative = -gyro_rate;  // 直接使用6050給的角速度
   // ====================
 
   // ========PITCH=======
@@ -388,6 +389,52 @@ ISR(TIMER2_COMPA_vect) {
     currentDMPAngle = ypr_temp[2];
     currentYaw = ypr_temp[0];
     input = currentDMPAngle;
+    // 獲取角速度
+    int16_t raw_gyro[3];
+    mpu.dmpGetGyro(raw_gyro, fifoBuffer);
+    float roll_gyro_rate = (raw_gyro[0] / 16.4) * DEG_TO_RAD;
+    // 判斷PID計算和是否傾倒偵測
+    if (!is_fallen) {
+      // 傾倒偵測 如果小車角度已經超過設定的傾倒角度 設定倒下旗標
+      if (abs(input) > fall_angle_limit) {
+        is_fallen = true;      // 設定倒下旗標
+        return_output = 0;     // 停止馬達
+        recovery_counter = 0;  // 清除回正計數器
+      }
+      // 計算PID並且使用分區增益
+      else {
+        output = Lite_PID(input, adj_setpoint, roll_gyro_rate);
+        output = constrain(output, -255, 255);
+        return_output = output;
+      }
+    }
+    // 已經倒下需要判斷是否扶正，並且讓recovery_counter計數
+    else {
+      return_output = 0;  // 確保馬達完全不動
+      // 判斷是否扶正(與中心 < 5 角度)
+      if (abs(input - adj_setpoint) < (5 * DEG_TO_RAD)) {
+        recovery_counter++;  // 回復計數器++
+
+        // 判斷是否已經扶正1秒鐘 (10ms x 100times = 1000ms)
+        if (recovery_counter >= 100) {
+          is_fallen = false;     // 取消傾倒狀態
+          recovery_counter = 0;  // 回復計數器歸零
+        }
+      } else {
+        //recovery_counter = 0;
+      }
+    }
+    // 平滑的重心轉移
+    // 0.04是減少的變數
+    current_angle_offset += (target_angle_offset - current_angle_offset) * 0.04;
+    adj_setpoint = base_setpoint + current_angle_offset;
+
+    // 最後輸出給馬達
+    float motor_cmd = return_output;
+    speed_L = motor_cmd + turn_req;
+    speed_R = motor_cmd - turn_req;
+
+    setMotorSpeed(speed_L, speed_R);
   } else {
     digitalWrite(led, LOW);
     isr_execution_time = micros() - startTime;
@@ -395,59 +442,7 @@ ISR(TIMER2_COMPA_vect) {
     return;
   }
 
-  // 判斷PID計算和是否傾倒偵測
-  if (!is_fallen) {
-    // 傾倒偵測 如果小車角度已經超過設定的傾倒角度 設定倒下旗標
-    if (abs(input) > fall_angle_limit) {
-      is_fallen = true;      // 設定倒下旗標
-      return_output = 0;     // 停止馬達
-      recovery_counter = 0;  // 清除回正計數器
-    }
-    // 計算PID並且使用分區增益
-    else {
-      output = Lite_PID(input, adj_setpoint);
-      output = constrain(output, -255, 255);
-      return_output = output;
-    }
-  }
-  // 已經倒下需要判斷是否扶正，並且讓recovery_counter計數
-  else {
-    return_output = 0;  // 確保馬達完全不動
-    // 判斷是否扶正(與中心 < 5 角度)
-    if (abs(input - adj_setpoint) < (5 * DEG_TO_RAD)) {
-      recovery_counter++;  // 回復計數器++
 
-      // 判斷是否已經扶正1秒鐘 (10ms x 100times = 1000ms)
-      if (recovery_counter >= 100) {
-        is_fallen = false;     // 取消傾倒狀態
-        recovery_counter = 0;  // 回復計數器歸零
-      }
-    } else {
-      //recovery_counter = 0;
-    }
-  }
-  // 平滑的重心轉移
-  // 計算目前角度與目標角度的差距
-  float error = target_angle_offset - current_angle_offset;
-
-  // 如果差距大於一步的距離，就往目標跨一步
-  if (abs(error) > transition_speed) {
-    // 判斷方向：如果目標在正前方就加，在後面就減
-    if (error > 0) current_angle_offset += transition_speed;
-    else current_angle_offset -= transition_speed;
-  }
-  // 如果差距已經小於一步的距離，直接貼齊目標，防止超過
-  else {
-    current_angle_offset = target_angle_offset;
-  }
-  adj_setpoint = base_setpoint + current_angle_offset;
-
-  // 最後輸出給馬達
-  float motor_cmd = return_output;
-  speed_L = motor_cmd + turn_req;
-  speed_R = motor_cmd - turn_req;
-
-  setMotorSpeed(speed_L, speed_R);
   // ==========================================================
   isr_execution_time = micros() - startTime;
   // 放置PID計算完成旗標，告訴Loop可以正常工作
@@ -580,6 +575,17 @@ void goNavigation() {
     } else {
       // 巡航區：維持固定傾角
       target_angle_offset = move_lean_angle;
+    }
+  } else if (nav_state == WAIT) {
+    if (millis() - wait_timer > 1500) {
+      current_wp++;
+      if (current_wp < total_wps) {
+        nav_state = CALC_PATH;  // 前往下一航點
+      } else {
+        nav_state = IDLE;       // 全部位置走完，釋放狀態機
+        is_navigating = false;  // 導航旗標正規歸零
+        Serial.println("巡航完成！");
+      }
     }
   }
 }
