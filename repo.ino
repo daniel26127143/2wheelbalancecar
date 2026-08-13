@@ -27,16 +27,16 @@ const int led = A0;
 
 // ★★★ 系統常數和PID參數 ★★★
 // Setpoint
-float input, output, base_setpoint = 0 * DEG_TO_RAD;
+float input, output, base_setpoint = -1.25 * DEG_TO_RAD;
 volatile float adj_setpoint = base_setpoint;
-//69.8
 // Roll
-// float Roll_Kp_Small = 2500.0, Roll_Ki_Small = 100.0, Roll_Kd_Small = 10000.0;  // ROLL誤差小
-float Roll_Kp_Small = 2700.0, Roll_Ki_Small = 165.0, Roll_Kd_Small = 53.0;  // ROLL誤差小
-float Roll_Kp_Mid = 3500.0, Roll_Ki_Mid = 0.0, Roll_Kd_Mid = 63.0;          // 誤差中
-float Roll_Kp_Large = 4000.0, Roll_Ki_Large = 0.0, Roll_Kd_Large = 75.0;    // 誤差大
-float limit_small = 2.0 * DEG_TO_RAD;
-float limit_mid = 4.0 * DEG_TO_RAD;
+// 原始kd是1700
+float Roll_Kp_Small = 1200, Roll_Ki_Small = 0.0, Roll_Kd_Small = 120;     // 小角度
+float Roll_Kp_Mid = 2800.0, Roll_Ki_Mid = 0.0, Roll_Kd_Mid = 0.0;        // 中角度
+float Roll_Kp_Large = 2800.0, Roll_Ki_Large = 0.0, Roll_Kd_Large = 0.0;  // 大角度
+float limit_small = 40.0 * DEG_TO_RAD;
+float limit_mid = 40.0 * DEG_TO_RAD;
+
 float Roll_Kp_Move = 2700.0, Roll_Ki_Move = 165.0, Roll_Kd_Move = 53.0;  // 移動時Roll徑度的PID                                                                                                                              // 前後移動時的PWM加值
 // Pitch
 float Pitch_Kp_Small = 0.0, Pitch_Ki_Small = 0.0, Pitch_Kd_Small = 0.0;  // Pitch徑度的PID
@@ -136,39 +136,57 @@ void stop() {
   setMotorSpeed(0, 0);
 }
 
-// 設定馬達輸出,輸入為兩馬達的PWM訊號
 void setMotorSpeed(float speedL, float speedR) {
-  speedL = speedL * 1.037;  //兩輪出場校正
+  speedL = speedL * 1.037;  // 兩輪出廠校正
   speedL = constrain(speedL, -255, 255);
   speedR = constrain(speedR, -255, 255);
-  // 設定pwmLR並且消去小角度
-  int pwmL = abs(speedL);
-  int pwmR = abs(speedR);
-  if (pwmL < 10) pwmL = 0;
-  if (pwmR < 10) pwmR = 0;
-  // 兩輪前進後退四種狀態
-  if (speedL >= 0 && speedR >= 0) {
+
+  // 設定死區平滑偏置值 (克服齒輪靜摩擦力的基礎力道，建議設 12)
+  int deadzone = 12; 
+
+  int pwmL = 0;
+  int pwmR = 0;
+
+  // 線性死區補償：在 PID 輸出的基礎上進行平滑偏置
+  if (speedL > 0) {
+    pwmL = speedL + deadzone;
+  } else if (speedL < 0) {
+    pwmL = speedL - deadzone;
+  }
+
+  if (speedR > 0) {
+    pwmR = speedR + deadzone;
+  } else if (speedR < 0) {
+    pwmR = speedR - deadzone;
+  }
+
+  // 限制 PWM 輸出在合法範圍 [-255, 255]
+  pwmL = constrain(pwmL, -255, 255);
+  pwmR = constrain(pwmR, -255, 255);
+
+  // 兩輪前進後退四種狀態判斷
+  if (pwmL >= 0 && pwmR >= 0) {
     digitalWrite(IN1M, LOW);
     digitalWrite(IN2M, HIGH);
     digitalWrite(IN3M, LOW);
     digitalWrite(IN4M, HIGH);
     is_L_Forward = true;
     is_R_Forward = true;
-  } else if (speedL < 0 && speedR < 0) {
+  } else if (pwmL < 0 && pwmR < 0) {
     digitalWrite(IN1M, HIGH);
     digitalWrite(IN2M, LOW);
     digitalWrite(IN3M, HIGH);
     digitalWrite(IN4M, LOW);
     is_L_Forward = false;
     is_R_Forward = false;
-  } else if (speedL < 0 && speedR >= 0) {
+  } else if (pwmL < 0 && pwmR >= 0) {
     digitalWrite(IN1M, HIGH);
     digitalWrite(IN2M, LOW);
     digitalWrite(IN3M, LOW);
     digitalWrite(IN4M, HIGH);
     is_L_Forward = false;
     is_R_Forward = true;
-  } else if (speedL >= 0 && speedR < 0) {
+  } else if (pwmL >= 0 && pwmR < 0) {
     digitalWrite(IN1M, LOW);
     digitalWrite(IN2M, HIGH);
     digitalWrite(IN3M, HIGH);
@@ -176,8 +194,10 @@ void setMotorSpeed(float speedL, float speedR) {
     is_L_Forward = true;
     is_R_Forward = false;
   }
-  analogWrite(PWMA, pwmL);
-  analogWrite(PWMB, pwmR);
+
+  // 寫入硬體 PWM 腳位
+  analogWrite(PWMA, abs(pwmL));
+  analogWrite(PWMB, abs(pwmR));
 }
 
 void calculate_Target_Yaw_Angle(float x, float y) {
@@ -636,6 +656,8 @@ void printInfo() {
     Serial.print(",");
     Serial.print(currentDMPAngle * RAD_TO_DEG, 2);
     Serial.print(",");
+    // Serial.print(roll_gyro_rate * RAD_TO_DEG, 2);
+    // Serial.print(",");
     Serial.print(return_output, 2);
     Serial.print(",");
     Serial.println(speed_L, 2);
