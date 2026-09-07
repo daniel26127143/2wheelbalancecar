@@ -3,12 +3,7 @@
 #include "MPU6050_6Axis_MotionApps20.h"
 #include <PinChangeInterrupt.h>
 
-//隨時可刪掉
-volatile float out_P = 0.0;
-volatile float out_I = 0.0;
-volatile float out_D = 0.0;
 // ★★★ 硬體腳位定義 ★★★
-// 馬達腳位
 #define IN1M 7
 #define IN2M 6
 #define PWMA 9
@@ -16,322 +11,145 @@ volatile float out_D = 0.0;
 #define IN4M 12
 #define PWMB 10
 #define STBY 8
-
-// led 定義
 const int led = A0;
 
-// Encoder 腳位定義
-#define ENC_PIN_L 2   // 左輪
-#define ENC_PIN_R A1  // 右輪
+#define ENC_PIN_L 2   // 左輪編碼器
+#define ENC_PIN_R A1  // 右輪編碼器
 
+// ★★★ 正統串級 PID 參數 (計算嚴格使用 SI 制：rad, rad/s) ★★★
 
-// ★★★ 系統常數和PID參數 ★★★
-// Setpoint
-float input, output, base_setpoint = -1.25 * DEG_TO_RAD;
+// 1. 直立內環 (Balance PD) 
+float Kp_balance = 1275.0;   // 比例推力 (對抗傾斜) 1300 > x >1200
+float Kd_balance = 70.0;     // 微分阻尼 (抑制前後震盪) 80 > x >60
+
+// 2. 速度外環 (Speed PI) - 分頻執行
+float Kp_speed = 2.3;        // 速度比例增益 2.8 > x >2.6
+float Ki_speed = 0.015;       // 速度積分增益 (消除重心偏移溜車)
+#define SPEED_LOOP_DIV 4      // 角度環實測週期10.13ms，4倍≈40.5ms，落在40~50ms需求區間
+
+// 3. 重心與保護常數
+float base_setpoint = -1.8 * DEG_TO_RAD; // 機械重心零點 (rad)
 volatile float adj_setpoint = base_setpoint;
-// Roll
-// 原始kd是1700
-float Roll_Kp_Small = 1200, Roll_Ki_Small = 0.0, Roll_Kd_Small = 120;     // 小角度
-float Roll_Kp_Mid = 2800.0, Roll_Ki_Mid = 0.0, Roll_Kd_Mid = 0.0;        // 中角度
-float Roll_Kp_Large = 2800.0, Roll_Ki_Large = 0.0, Roll_Kd_Large = 0.0;  // 大角度
-float limit_small = 40.0 * DEG_TO_RAD;
-float limit_mid = 40.0 * DEG_TO_RAD;
+float fall_limit = 35.0 * DEG_TO_RAD;     // 傾倒保護限制 (超過 ±35 度斷電)
 
-float Roll_Kp_Move = 2700.0, Roll_Ki_Move = 165.0, Roll_Kd_Move = 53.0;  // 移動時Roll徑度的PID                                                                                                                              // 前後移動時的PWM加值
-// Pitch
-float Pitch_Kp_Small = 0.0, Pitch_Ki_Small = 0.0, Pitch_Kd_Small = 0.0;  // Pitch徑度的PID
-// Yaw
-float Yaw_Kp_Small = 0.0, Yaw_Ki_Small = 0.0, Yaw_Kd_Small = 0.0;  // Yaw徑度的PID
-// Orient
-float Orient_Kp = 150.0, Orient_Ki = 0.0, Orient_Kd = 0.0;
-// Track
-float Track_Kp = 3.0, Track_Ki = 0.0, Track_Kd = 0.0;
-// Speed
-float Speed_Kp = 1.5, Speed_Ki = 0.05;
-
-float target_setpoint = base_setpoint;      // 最終目標角度
-float max_lean_angle = 2.0 * DEG_TO_RAD;    // 最大傾斜角度
-float angle_step_size = 0.02 * DEG_TO_RAD;  // 平滑過渡的步伐 (越小越柔順)
-
-float fall_angle_limit = 40 * DEG_TO_RAD;  // 超過 ±40 度就停車
-
-
-// ★★★ 全域變數 ★★★
-
-// 移動可調參數
-float move_lean_angle = -0.65 * DEG_TO_RAD;  // 巡航時的傾角（統一命名，方便之後調整）
-float decel_fraction = 0.0;                  // 最後 35% 的距離開始減速，可依測試調整
-
-// 核心監控變數
-volatile unsigned long overlap_count = 0;       // 記錄總共發生幾次重疊衝突
-volatile unsigned long isr_execution_time = 0;  // 記錄中斷核心計算花了幾秒
-
-// MPU6050 與 DMP設定
+// 系統全域變數
 MPU6050 mpu;
 bool dmpReady = false;
-uint8_t devStatus;
 uint16_t packetSize;
-uint16_t fifoCount;
 uint8_t fifoBuffer[64];
 Quaternion q;
 VectorFloat gravity;
 
-//紀錄馬達轉向
+volatile bool is_fallen = true;
+unsigned long recovery_counter = 0;
+
+volatile long encoder_count_L = 0;
+volatile long encoder_count_R = 0;
 volatile bool is_L_Forward = true;
 volatile bool is_R_Forward = true;
 
-// 轉向控制變數
-volatile float currentYaw = 0.0;       // 目前航向角
-volatile float currentDMPAngle = 0.0;  // 目前俯仰角
-float target_Yaw = 0.0;                // 目標航向角
+// 濾波與中間狀態
+float current_angle = 0.0;     // 當前車身傾角 (rad)
+float current_gyro_rate = 0.0; // 當前俯仰角速度 (rad/s)
+float filtered_speed = 0.0;    // 低通濾波後的車輪速度
+float speed_integral = 0.0;    // 速度環積分
+float speed_angle_target = 0.0;// 速度環計算出的傾角補償量 (rad)
+float target_speed = 0.0;      // 目標速度 (原地平衡為 0)
+float turn_cmd = 0.0;          // 轉向命令
 
-volatile bool is_fallen = true;
-volatile bool pid_computed = false;
-volatile float return_output = 0.0;  // ISR 所需要的回傳值
-static bool is_navigating = false;   // 是否正在自動導航
-unsigned long recovery_counter = 0;  // 用於扶正回復時的計數器
-
-//PID orient track的誤差值
-float Roll_error = 0, Roll_last_error = 0, Roll_integral = 0, Roll_derivative = 0;      // 前兩為誤差值，後面兩個是I和D的儲存的誤差值
-float Pitch_error = 0, Pitch_last_error = 0, Pitch_integral = 0, Pitch_derivative = 0;  // 前兩為誤差值，後面兩個是I和D的儲存的誤差值
-float Yaw_error = 0, Yaw_last_error = 0, Yaw_integral = 0, Yaw_derivative = 0;          // 前兩為誤差值，後面兩個是I和D的儲存的誤差值
-float Orient_error = 0, Orient_last_error = 0, Orient_integral = 0, Orient_derivative = 0;
-float Track_error = 0, Track_last_error = 0, Track_integral = 0, Track_derivative = 0;
-float Speed_integral = 0.0;  //車速的I值計算用
-float target_speed = 0.0;    // 期望車速 (正前進，負後退，0煞車定點)
-float filtered_speed = 0.0;  // 濾波後的真實車速
-
-float targetYaw = 0.0;       // 目標航向角 (度)
-bool isAutoTurning = false;  // 是否正在自動轉彎
-float turn_cmd_pwm = 0;      // 計算出來的轉向 PWM
-volatile float speed_L, speed_R;
-
-// Encoder 計數變數
-volatile long encoder_count_L = 0;
-volatile long encoder_count_R = 0;
-
-
-// 狀態變數
-volatile float turn_req = 0.0;
-long start_pos = 0;
-long target_ticks = 0;
-volatile float target_angle_offset = 0.0;
-volatile float current_angle_offset = 0.0;
-float transition_speed = 0.02 * DEG_TO_RAD;
-unsigned long wait_timer = 0;
-
+// ★★★ 底層驅動函式 ★★★
 void initMotorPins() {
-  pinMode(IN1M, OUTPUT);
-  pinMode(IN2M, OUTPUT);
-  pinMode(PWMA, OUTPUT);
-  pinMode(IN3M, OUTPUT);
-  pinMode(IN4M, OUTPUT);
-  pinMode(PWMB, OUTPUT);
+  pinMode(IN1M, OUTPUT); pinMode(IN2M, OUTPUT); pinMode(PWMA, OUTPUT);
+  pinMode(IN3M, OUTPUT); pinMode(IN4M, OUTPUT); pinMode(PWMB, OUTPUT);
   pinMode(STBY, OUTPUT);
   digitalWrite(STBY, HIGH);
 }
 
-// 設定馬達輸出為零
-void stop() {
-  setMotorSpeed(0, 0);
-}
-
 void setMotorSpeed(float speedL, float speedR) {
-  speedL = speedL * 1.037;  // 兩輪出廠校正
-  speedL = constrain(speedL, -255, 255);
+  speedL = constrain(speedL * 1.037, -255, 255);
   speedR = constrain(speedR, -255, 255);
 
-  // 設定死區平滑偏置值 (克服齒輪靜摩擦力的基礎力道，建議設 12)
-  int deadzone = 12; 
+  int deadzone = 5; // 
+  int pwmL = (speedL > 0) ? (speedL + deadzone) : ((speedL < 0) ? (speedL - deadzone) : 0);
+  int pwmR = (speedR > 0) ? (speedR + deadzone) : ((speedR < 0) ? (speedR - deadzone) : 0);
 
-  int pwmL = 0;
-  int pwmR = 0;
-
-  // 線性死區補償：在 PID 輸出的基礎上進行平滑偏置
-  if (speedL > 0) {
-    pwmL = speedL + deadzone;
-  } else if (speedL < 0) {
-    pwmL = speedL - deadzone;
-  }
-
-  if (speedR > 0) {
-    pwmR = speedR + deadzone;
-  } else if (speedR < 0) {
-    pwmR = speedR - deadzone;
-  }
-
-  // 限制 PWM 輸出在合法範圍 [-255, 255]
   pwmL = constrain(pwmL, -255, 255);
   pwmR = constrain(pwmR, -255, 255);
 
-  // 兩輪前進後退四種狀態判斷
-  if (pwmL >= 0 && pwmR >= 0) {
-    digitalWrite(IN1M, LOW);
-    digitalWrite(IN2M, HIGH);
-    digitalWrite(IN3M, LOW);
-    digitalWrite(IN4M, HIGH);
-    is_L_Forward = true;
-    is_R_Forward = true;
-  } else if (pwmL < 0 && pwmR < 0) {
-    digitalWrite(IN1M, HIGH);
-    digitalWrite(IN2M, LOW);
-    digitalWrite(IN3M, HIGH);
-    digitalWrite(IN4M, LOW);
-    is_L_Forward = false;
-    is_R_Forward = false;
-  } else if (pwmL < 0 && pwmR >= 0) {
-    digitalWrite(IN1M, HIGH);
-    digitalWrite(IN2M, LOW);
-    digitalWrite(IN3M, LOW);
-    digitalWrite(IN4M, HIGH);
-    is_L_Forward = false;
-    is_R_Forward = true;
-  } else if (pwmL >= 0 && pwmR < 0) {
-    digitalWrite(IN1M, LOW);
-    digitalWrite(IN2M, HIGH);
-    digitalWrite(IN3M, HIGH);
-    digitalWrite(IN4M, LOW);
-    is_L_Forward = true;
-    is_R_Forward = false;
+  // 左輪方向
+  if (pwmL >= 0) {
+    digitalWrite(IN1M, LOW); digitalWrite(IN2M, HIGH); is_L_Forward = true;
+  } else {
+    digitalWrite(IN1M, HIGH); digitalWrite(IN2M, LOW); is_L_Forward = false;
   }
 
-  // 寫入硬體 PWM 腳位
+  // 右輪方向
+  if (pwmR >= 0) {
+    digitalWrite(IN3M, LOW); digitalWrite(IN4M, HIGH); is_R_Forward = true;
+  } else {
+    digitalWrite(IN3M, HIGH); digitalWrite(IN4M, LOW); is_R_Forward = false;
+  }
+
   analogWrite(PWMA, abs(pwmL));
   analogWrite(PWMB, abs(pwmR));
 }
 
-void calculate_Target_Yaw_Angle(float x, float y) {
-  //使用 atan2 算出徑度 (Radians)
-  float target_rad = atan2(y, x);
-  target_Yaw = target_rad;
-  float display_deg = target_rad / DEG_TO_RAD;
+void stopMotors() {
+  analogWrite(PWMA, 0); analogWrite(PWMB, 0);
+  digitalWrite(IN1M, LOW); digitalWrite(IN2M, LOW);
+  digitalWrite(IN3M, LOW); digitalWrite(IN4M, LOW);
 }
 
-float Lite_PID(float input, float adj_setpoint, float gyro_rate) {
-  float Roll_PID_output = 0.0;
-  // ======== ROLL =======
-  // 計(P)
-  Roll_error = adj_setpoint - input;
-  // 算(I)
-  if (abs(Roll_error) < limit_small) {
-    Roll_integral += Roll_error;
-    Roll_integral = constrain(Roll_integral, -0.1, 0.1);
-  } else {
-    Roll_integral = Roll_integral * 0.9;
-  }
-  // 算(D)
-  // Roll_derivative = Roll_error - Roll_last_error;
-  Roll_derivative = -gyro_rate;  // 直接使用6050給的角速度
-  // ====================
+// 編碼器中斷
+void Code_left()  { encoder_count_L += is_L_Forward ? 1 : -1; }
+void Code_right() { encoder_count_R += is_R_Forward ? 1 : -1; }
 
-  // ========PITCH=======
-  // 計(P)
-  Pitch_error = adj_setpoint - input;
-  // 算(I)
-  Pitch_integral += Pitch_error;
-  Pitch_integral = constrain(Pitch_integral, -1, 1);
-  // 算(D)
-  Pitch_derivative = Pitch_error - Pitch_last_error;
-  // ====================
+// ★★★ 核心控制演算法 ★★★
 
-  // ======== Yaw =======
-  // 計(P)
-  Yaw_error = adj_setpoint - input;
-  // 算(I)
-  Yaw_integral += Yaw_error;
-  Yaw_integral = constrain(Yaw_integral, -1, 1);
-  // 算(D)
-  Yaw_derivative = Yaw_error - Yaw_last_error;
-  // ====================
-
-  if (is_navigating) {
-    // 移動 PID控制
-    Roll_PID_output = (Roll_Kp_Move * Roll_error) + (Roll_Ki_Move * Roll_integral) + (Roll_Kd_Move * Roll_derivative);
-  } else {
-    float abs_err = abs(Roll_error);
-
-    if (abs_err < limit_small) {
-      // 1. 小角度區間
-      Roll_PID_output = (Roll_Kp_Small * Roll_error) + (Roll_Ki_Small * Roll_integral) + (Roll_Kd_Small * Roll_derivative);
-    } else if (abs_err < limit_mid) {
-      // 2. 中角度區間
-      Roll_PID_output = (Roll_Kp_Mid * Roll_error) + (Roll_Ki_Mid * Roll_integral) + (Roll_Kd_Mid * Roll_derivative);
-    } else {
-      // 3. 大角度區間
-      Roll_PID_output = (Roll_Kp_Large * Roll_error) + (Roll_Ki_Large * Roll_integral) + (Roll_Kd_Large * Roll_derivative);
-    }
-  }
-
-  // 紀錄兩次的error之間
-  Roll_last_error = Roll_error;
-  // 限制輸出範圍
-  return constrain(Roll_PID_output, -255, 255);
-}
-// 左輪中斷 encoder
-void Code_left() {
-  encoder_count_L += is_L_Forward ? 1 : -1;
+// 1. 直立平衡內環 (PD 控制器 - 高頻調度)
+float Balance_PD(float angle, float target_angle, float gyro_rate) {
+  float error = target_angle - angle;
+  // D 項直接使用角速度 (提供精確物理阻尼)
+  float balance_output = (Kp_balance * error) - (Kd_balance * gyro_rate);
+  return constrain(balance_output, -255, 255);
 }
 
-// 右輪中斷 encoder
-void Code_right() {
-  encoder_count_R += is_R_Forward ? 1 : -1;
-}
-
-float Speed_PI() {
-  // 讀取兩輪的encoder
-  float current_speed = (encoder_count_L + encoder_count_R) / 2.0;
+// 2. 速度位移外環 (PI 控制器 - 低頻調度)
+float Speed_PI(float target_spd) {
+  // 採樣當前左右輪速度平均值 (Ticks / 43ms)
+  float raw_speed = (encoder_count_L + encoder_count_R) / 2.0;
   encoder_count_L = 0;
   encoder_count_R = 0;
-  static int speed_index = 0;
-  static float speed_history[3] = { 0.0, 0.0, 0.0 };
 
-  // 如果不在巡航模式，把歷史陣列與積分全部清空
-  if (!is_navigating) {
-    Speed_integral = 0;
-    speed_history[0] = 0;
-    speed_history[1] = 0;
-    speed_history[2] = 0;
-    return 0.0;  // 煞車定點回傳 0
-  }
+  // 一階低通濾波，抑制齒輪敲擊高頻抖動
+  filtered_speed = (filtered_speed * 0.7) + (raw_speed * 0.3);
 
-  speed_history[speed_index] = current_speed;
-  speed_index++;
+  // 速度偏差 (以車身傾角修正消除溜車)
+  float speed_error = filtered_speed - target_spd;
+  speed_integral += speed_error;
+  speed_integral = constrain(speed_integral, -800.0, 800.0); // 嚴防積分飽和
 
-  // 當指標超過陣列大小時，讓它歸零循環
-  if (speed_index >= 3) {
-    speed_index = 0;
-  }
-
-  // 算出 3 次的平均值
-  filtered_speed = (speed_history[0] + speed_history[1] + speed_history[2]) / 3.0;
-  // 計算 PI 誤差與積分
-  float Speed_error = target_speed - filtered_speed;
-
-  Speed_integral += Speed_error;
-  Speed_integral = constrain(Speed_integral, -1500.0, 1500.0);
-  // 計算速度環輸出
-  float speed_output = (Speed_Kp * Speed_error) + (Speed_Ki * Speed_integral);
-
-  // 將輸出轉換為角度量級，並限制最大傾角
-  speed_output = speed_output * 0.001;
-  speed_output = constrain(speed_output, -2.0 * DEG_TO_RAD, 2.0 * DEG_TO_RAD);
-
-  return speed_output;
+  // 外環輸出：轉換為直立環的「目標傾斜補償角 (rad)」
+  float angle_offset = (Kp_speed * speed_error + Ki_speed * speed_integral) * 0.001;
+  return constrain(angle_offset, -4.0 * DEG_TO_RAD, 4.0 * DEG_TO_RAD); // 限幅最大補償 ±4 度
 }
 
+// ★★★ SETUP ★★★
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200); // 採用高速序列埠傳輸
   Wire.begin();
   Wire.setClock(400000);
   initMotorPins();
+  stopMotors();
+
   pinMode(led, OUTPUT);
-  digitalWrite(led, LOW);  // 確保LED起始是滅的
-  // 設定 Encoder 上拉模式
   pinMode(ENC_PIN_L, INPUT_PULLUP);
   pinMode(ENC_PIN_R, INPUT_PULLUP);
-  mpu.initialize();
-  devStatus = mpu.dmpInitialize();
 
+  mpu.initialize();
+  uint8_t devStatus = mpu.dmpInitialize();
+
+  // 寫入 MPU6050 晶片校準值
   mpu.setXAccelOffset(1930);
   mpu.setYAccelOffset(-1670);
   mpu.setZAccelOffset(1540);
@@ -343,24 +161,18 @@ void setup() {
     mpu.setDMPEnabled(true);
     dmpReady = true;
     packetSize = mpu.dmpGetFIFOPacketSize();
-    Serial.println("DMP 啟動完成");
+    Serial.println("DMP 啟動成功，進入正統雙閉環模式");
   } else {
-    Serial.print("DMP Fail: ");
-    Serial.println(devStatus);
-    while (1)
-      ;
+    while (1);
   }
 
-  // 左輪使用標準中斷
   attachInterrupt(0, Code_left, CHANGE);
-  // 右輪使用 PinChangeInt
   attachPCINT(digitalPinToPCINT(ENC_PIN_R), Code_right, CHANGE);
 
-  // TIMER2設定
+  // TIMER2 CTC 中斷設定：單次比較中斷0.596ms，div_count累積17次才執行本體
+  // 角度環實際執行週期 = 0.596ms × 17 ≈ 10.13ms
   cli();
-  TCCR2A = 0;
-  TCCR2B = 0;
-  TCNT2 = 0;
+  TCCR2A = 0; TCCR2B = 0; TCNT2 = 0;
   OCR2A = 148;
   TCCR2A |= (1 << WGM21);
   TCCR2B |= (1 << CS22);
@@ -368,35 +180,24 @@ void setup() {
   sei();
 }
 
+// ★★★ TIMER2 控制中斷 (高精度時序調度) ★★★
 ISR(TIMER2_COMPA_vect) {
-  // 宣告中斷秒數的變數
-  static int count = 0;
-  count++;
+  static int div_count = 0;
+  div_count++;
+  if (div_count < 17) return;
+  div_count = 0;
 
-  // 檢查是否到中斷時間
-  if (count < 6) {
-    return;
-  }
-  count = 0;
-  static volatile bool busy_flag = false;
+  static volatile bool is_computing = false;
+  if (is_computing) return;
+  is_computing = true;
 
-  if (busy_flag) {
-    overlap_count++;  // 如果發現上鎖了，重疊次數 +1
-    return;
-  }
-  busy_flag = true;  // 進入計算，立刻上鎖！
+  sei(); // 允許中斷巢狀以保證編碼器計數準確
 
-  // 以下進入真正的中斷
-  sei();
-  digitalWrite(led, HIGH);
-  unsigned long startTime = micros();
-  // 讀取 FIFO
-  fifoCount = mpu.getFIFOCount();
+  // 讀取 DMP 封包
+  uint16_t fifoCount = mpu.getFIFOCount();
   if (fifoCount == 1024) {
     mpu.resetFIFO();
-    digitalWrite(led, LOW);
-    isr_execution_time = micros() - startTime;
-    busy_flag = false;
+    is_computing = false;
     return;
   }
 
@@ -405,293 +206,74 @@ ISR(TIMER2_COMPA_vect) {
     mpu.dmpGetGravity(&gravity, &q);
     float ypr_temp[3];
     mpu.dmpGetYawPitchRoll(ypr_temp, &q, &gravity);
-    // 取得原始徑度
-    currentDMPAngle = ypr_temp[2];
-    currentYaw = ypr_temp[0];
-    input = currentDMPAngle;
-    // 獲取角速度
+
+    // 取得當前姿態 (SI 制：rad, rad/s)
+    current_angle = -ypr_temp[2];
     int16_t raw_gyro[3];
     mpu.dmpGetGyro(raw_gyro, fifoBuffer);
-    float roll_gyro_rate = (raw_gyro[0] / 16.4) * DEG_TO_RAD;
-    // 判斷PID計算和是否傾倒偵測
-    if (!is_fallen) {
-      // 傾倒偵測 如果小車角度已經超過設定的傾倒角度 設定倒下旗標
-      if (abs(input) > fall_angle_limit) {
-        is_fallen = true;      // 設定倒下旗標
-        return_output = 0;     // 停止馬達
-        recovery_counter = 0;  // 清除回正計數器
-      }
-      // 計算PID並且使用分區增益
-      else {
-        output = Lite_PID(input, adj_setpoint, roll_gyro_rate);
-        output = constrain(output, -255, 255);
-        return_output = output;
-      }
-    }
-    // 已經倒下需要判斷是否扶正，並且讓recovery_counter計數
+    current_gyro_rate = -(raw_gyro[0] / 16.4) * DEG_TO_RAD;
+
+    // 1. 傾倒安全檢查
+    if (abs(current_angle - base_setpoint) > fall_limit) {
+      is_fallen = true;
+      stopMotors();
+      speed_integral = 0.0;
+      encoder_count_L = 0;   // 跌倒期間車輪仍可能被搬動而觸發編碼器，順便歸零避免扶正瞬間假速度暴衝
+      encoder_count_R = 0;
+      recovery_counter = 0;
+    } 
+    // 2. 正常自平衡控制
     else {
-      return_output = 0;  // 確保馬達完全不動
-      // 判斷是否扶正(與中心 < 5 角度)
-      if (abs(input - adj_setpoint) < (5 * DEG_TO_RAD)) {
-        recovery_counter++;  // 回復計數器++
-
-        // 判斷是否已經扶正1秒鐘 (10ms x 100times = 1000ms)
-        if (recovery_counter >= 100) {
-          is_fallen = false;     // 取消傾倒狀態
-          recovery_counter = 0;  // 回復計數器歸零
+      // 扶正判斷
+      if (is_fallen) {
+        if (abs(current_angle - base_setpoint) < (3.0 * DEG_TO_RAD)) {
+          recovery_counter++;
+          if (recovery_counter > 20) { // 20次 × 10.13ms ≈ 0.2秒，穩定維持0.2秒後解除保護
+            is_fallen = false;
+            recovery_counter = 0;
+          }
         }
-      } else {
-        //recovery_counter = 0;
       }
-    }
-    // 平滑的重心轉移
-    // 0.04是減少的變數
-    current_angle_offset += (target_angle_offset - current_angle_offset) * 0.04;
-    adj_setpoint = base_setpoint + current_angle_offset;
 
-    // 最後輸出給馬達
-    float motor_cmd = return_output;
-    speed_L = motor_cmd + turn_req;
-    speed_R = motor_cmd - turn_req;
+      if (!is_fallen) {
+        // [外環] 速度 PI 分頻運算 (約 43ms 執行一次)
+        static int speed_loop_counter = 0;
+        speed_loop_counter++;
+        if (speed_loop_counter >= SPEED_LOOP_DIV) {
+          speed_loop_counter = 0;
+          speed_angle_target = Speed_PI(target_speed);
+        }
 
-    setMotorSpeed(speed_L, speed_R);
-  } else {
-    digitalWrite(led, LOW);
-    isr_execution_time = micros() - startTime;
-    busy_flag = false;
-    return;
-  }
+        // 串級疊加：直立環目標角 = 機械基準角 + 速度環補償角
+        adj_setpoint = base_setpoint + speed_angle_target;
 
+        // [內環] 直立環 PD 運算 (約 3.58ms 執行一次)
+        float balance_pwm = Balance_PD(current_angle, adj_setpoint, current_gyro_rate);
 
-  // ==========================================================
-  isr_execution_time = micros() - startTime;
-  // 放置PID計算完成旗標，告訴Loop可以正常工作
-  pid_computed = true;
-  busy_flag = false;
-  digitalWrite(led, LOW);
-}
-
-//一些原本放在loop裡面的變數提出來
-enum NavState { IDLE,
-                CALC_PATH,
-                TURNING,
-                MOVING,
-                WAIT };
-NavState nav_state = IDLE;
-
-// 定義座標 (X, Y)
-float waypoints[2][2] = {
-  { 0.0, 0.0 },  // 起點
-  { 1.0, 0.0 }   //
-};
-int current_wp = 1;
-int total_wps = 2;
-
-float UNIT_TO_CM = 10.0;
-float current_X = 0.0;   // 絕對 X 座標
-float current_Y = 0.0;   // 絕對 Y 座標
-long last_odom_pos = 0;  // 紀錄上一次計算時的輪胎位置
-
-
-// 處理導航模式
-void processCommand() {
-  if (Serial.available()) {
-    char cmd = Serial.read();
-    if (cmd == 'G' || cmd == 'g') {
-      nav_state = CALC_PATH;
-      current_wp = 1;
-      is_navigating = true;
-
-      // 每次啟動，重置絕對座標
-      current_X = 0.0;
-      current_Y = 0.0;
-      last_odom_pos = (encoder_count_L + encoder_count_R) / 2;
-      Serial.println("啟動");
-    } else if (cmd == 'W' || cmd == 'w') {
-      is_navigating = true;
-      nav_state = MOVING;
-      target_angle_offset = move_lean_angle;
-      target_ticks = 243;
-      start_pos = (encoder_count_L + encoder_count_R) / 2;
-      Serial.println("前進 15cm");
-    } else if (cmd == 'S' || cmd == 's') {
-      nav_state = IDLE;
-      is_navigating = false;
-      target_angle_offset = 0.0;
-      turn_req = 0.0;
-      Roll_integral = 0;
-      Serial.println("煞車");
-    }
-  }
-}
-
-// 傾倒保護
-void checkstatus() {
-  if (is_fallen) {
-    stop();
-    nav_state = IDLE;
-    is_navigating = false;
-    turn_req = 0;
-    target_angle_offset = 0.0;
-    current_angle_offset = 0.0;
-    Roll_integral = 0;
-    adj_setpoint = base_setpoint;
-  }
-}
-
-// 導航模式
-void goNavigation() {
-  if (!is_navigating) return;
-
-  if (nav_state == CALC_PATH) {
-    float dx = waypoints[current_wp][0] - current_X;
-    float dy = waypoints[current_wp][1] - current_Y;
-
-    target_Yaw = atan2(dy, dx);
-    float distance_cm = sqrt(dx * dx + dy * dy) * UNIT_TO_CM;
-
-    target_ticks = distance_cm * 16.18;
-
-    Serial.print("前往點 ");
-    Serial.print(current_wp);
-    Serial.print(" | 距離: ");
-    Serial.println(distance_cm);
-    nav_state = TURNING;
-  } else if (nav_state == TURNING) {
-    float yaw_error = target_Yaw - currentYaw;
-    while (yaw_error > PI) yaw_error -= TWO_PI;
-    while (yaw_error < -PI) yaw_error += TWO_PI;
-
-    turn_req = yaw_error * 30.0;
-
-    // 轉向完成
-    if (abs(yaw_error) < (3.0 * DEG_TO_RAD)) {
-      turn_req = 0.0;
-      start_pos = (encoder_count_L + encoder_count_R) / 2;
-      target_angle_offset = move_lean_angle;
-      nav_state = MOVING;
-      Serial.println("開始直行...");
-    }
-  } else if (nav_state == MOVING) {
-    long current_pos = (encoder_count_L + encoder_count_R) / 2;
-    long moved_distance = current_pos - start_pos;
-    long remaining_ticks = target_ticks - moved_distance;
-    long decel_start_ticks = target_ticks * decel_fraction;
-
-    turn_req = 0.0;
-
-    if (remaining_ticks <= 0) {
-      // 抵達終點
-      target_angle_offset = 0.0;
-      turn_req = 0.0;
-      Serial.println("抵達");
-      wait_timer = millis();
-      nav_state = WAIT;
-    } else if (decel_start_ticks > 0 && remaining_ticks < decel_start_ticks) {
-      // 減速區：傾角隨剩餘距離線性收斂到 0
-      float decel_ratio = (float)remaining_ticks / decel_start_ticks;
-      decel_ratio = constrain(decel_ratio, 0.15, 1.0);  // 保留最低15%動力，避免還沒到就停下不動
-      target_angle_offset = move_lean_angle * decel_ratio;
-    } else {
-      // 巡航區：維持固定傾角
-      target_angle_offset = move_lean_angle;
-    }
-  } else if (nav_state == WAIT) {
-    if (millis() - wait_timer > 1500) {
-      current_wp++;
-      if (current_wp < total_wps) {
-        nav_state = CALC_PATH;  // 前往下一航點
-      } else {
-        nav_state = IDLE;       // 全部位置走完，釋放狀態機
-        is_navigating = false;  // 導航旗標正規歸零
-        Serial.println("巡航完成！");
+        // 合成最終馬達輸出
+        float motor_L = balance_pwm + turn_cmd;
+        float motor_R = balance_pwm - turn_cmd;
+        setMotorSpeed(motor_L, motor_R);
       }
     }
   }
+
+  is_computing = false;
 }
 
-// void executeBalance() {
-//   pid_computed = false;
-// }
-
-// void printInfo() {
-//   static unsigned long lastPrint = 0;
-//   if (millis() - lastPrint > 100) {
-//     lastPrint = millis();
-
-//     // 輸出即時的XY跟角度
-//     Serial.print("X: ");
-//     Serial.print(current_Y, 2);
-//     Serial.print(" | Y: ");
-//     Serial.print(current_X, 2);
-//     Serial.print(" | 角度: ");
-//     Serial.print(currentDMPAngle * RAD_TO_DEG, 1);
-//     //
-//     // 輸出剩餘距離
-//     if (is_navigating && nav_state == MOVING) {
-//       long current_pos = (encoder_count_L + encoder_count_R) / 2;
-//       long moved_distance = current_pos - start_pos;
-//       long remaining_ticks = abs(target_ticks) - abs(moved_distance);
-
-//       float remaining_cm = remaining_ticks / 16.18;
-//       if (remaining_cm < 0) remaining_cm = 0;
-
-//       Serial.print(" | 和目標還差: ");
-//       Serial.print(remaining_cm, 1);
-//       Serial.println(" cm");
-//     } else {
-//       // 換行結尾
-//       Serial.println();
-//     }
-//   }
-// }
-// matlab所使用的
-void printInfo() {
+// ★★★ 主迴圈 (僅負責監控與人機介面，不介入控制時序) ★★★
+void loop() {
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint > 100) {
     lastPrint = millis();
-
-    // 格式固定為：時間,目前角度,PID原力,最終左輪PWM
-    Serial.print(millis());
-    Serial.print(",");
-    Serial.print(currentDMPAngle * RAD_TO_DEG, 2);
-    Serial.print(",");
-    // Serial.print(roll_gyro_rate * RAD_TO_DEG, 2);
-    // Serial.print(",");
-    Serial.print(return_output, 2);
-    Serial.print(",");
-    Serial.println(speed_L, 2);
+    // 顯示轉換為「度 (deg)」輸出，便於工程肉眼觀測
+    Serial.print("角度: ");
+    Serial.print(current_angle * RAD_TO_DEG, 2);
+    Serial.print("° | 目標: ");
+    Serial.print(adj_setpoint * RAD_TO_DEG, 2);
+    Serial.print("° | 速度濾波: ");
+    Serial.print(filtered_speed, 1);
+    Serial.print(" | 狀態: ");
+    Serial.println(is_fallen ? "倒下保護" : "平衡運行");
   }
-}
-
-void updateOdometry() {
-  long current_pos = (encoder_count_L + encoder_count_R) / 2;
-  long delta_ticks = current_pos - last_odom_pos;
-  last_odom_pos = current_pos;  // 記住這次的位置給下一次用
-
-  if (delta_ticks != 0) {
-    //tick -> 公分 (1公分 = 16.18 Ticks)
-    float delta_cm = delta_ticks / 16.18;
-
-    // 再把公分換算成「地圖座標單位」
-    float delta_units = delta_cm / UNIT_TO_CM;
-
-    // 透過三角函數與當下的車頭朝向，拆解出 X 與 Y 的移動量並累加
-    current_X += delta_units * cos(currentYaw);
-    current_Y += delta_units * sin(currentYaw);
-  }
-}
-
-void loop() {
-  processCommand();  // 聽取藍牙指令
-  checkstatus();     // 確認狀態
-
-  // 當PID計算完成後判斷有無傾倒才開始計算
-  if (pid_computed && !is_fallen) {
-    updateOdometry();
-    goNavigation();  // 指令
-    pid_computed = false;
-  }
-
-  printInfo();  // 輸出數據
 }
