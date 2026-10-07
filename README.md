@@ -1,4 +1,4 @@
-# Design of a Omnidirectional-Wheel Self-Balancing Robot
+# Design of an Omnidirectional-Wheel Self-Balancing Robot
 
 
 
