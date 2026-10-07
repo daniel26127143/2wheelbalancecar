@@ -12,13 +12,13 @@ An underactuated, two-wheel inverted pendulum robot driven by collinear Mecanum 
 
 ---
 
-## 📌 Project Overview
+##  Project Overview
 
 This project implements a self-balancing inverted pendulum utilizing collinear Mecanum wheels. The primary engineering objective is to solve the non-linear dynamics of an underactuated 2-wheel balance core before mechanically expanding to a 3-wheel platform that unlocks pure lateral planar crabbing without body orientation adjustments.
 
 ---
 
-## 🚀 Key Validated Benchmarks
+##  Key Validated Benchmarks
 
 - **Continuous Stationary Balance**: Achieved **> 90 seconds** uninterrupted upright balance without positional drift[cite: 6].
 - **Precision Upright Neutral**: Steady-state pitch variance tightly bounded within **±0.4°**[cite: 6].
@@ -27,7 +27,7 @@ This project implements a self-balancing inverted pendulum utilizing collinear M
 
 ---
 
-## ⚙️ Control Firmware & Architecture
+##  Control Firmware & Architecture
 
 The control system adopts a decoupled, dual-rate cascade architecture:
 
@@ -47,7 +47,7 @@ The control system adopts a decoupled, dual-rate cascade architecture:
 
 ---
 
-## 🛠️ Hardware Specifications & Pinout
+##  Hardware Specifications & Pinout
 
 | Subsystem | Component / Specification | Pin Assignment / Interface |
 | :--- | :--- | :--- |
