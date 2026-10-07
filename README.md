@@ -5,7 +5,7 @@
 
 [![Demo Video](https://img.shields.io/badge/YouTube-實機展演影片-red?logo=youtube)](https://www.youtube.com/shorts/cfTprMj1Mzs)
 [![Platform](https://img.shields.io/badge/硬體平台-Arduino%20Uno-blue.svg)](https://www.arduino.cc/)
-[![License: MIT](https://img.shields.io/badge/開源授權-MIT-green.svg)](https://opensource.org/licenses/MIT)
+
 
 [English](README.md) | [繁體中文](README_zh.md)
 
