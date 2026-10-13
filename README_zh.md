@@ -85,11 +85,11 @@ Timer2（CTC 模式）中斷每 **10.13 ms（98.7 Hz）** 執行一次平衡環�
 
 ## 資料夾結構
 
-| 資料夾 | 內容 |
+| 路徑 | 內容 |
 |---|---|
-| `latest/` | 最新韌體（`repo.ino`，v34，同資料夾放 `nav.h`、`nav_cmd.h`、`rec.h`、`tuning.h`） |
-| `latest/python/` | 電腦端工具：`drive.py`（遙控）、`nav.py`（路線）、`autotest.py`、`analyze.py` 等，詳見裡面的 README |
-| `stable/` | 較早的穩定版本 |
+| `repo.ino`、`nav.h`、`nav_cmd.h`、`rec.h`、`tuning.h` | 目前的韌體（v34）。這五個檔案要放在同一個資料夾 |
+| `python/` | 電腦端工具：`drive.py`（遙控）、`nav.py`（路線）、`autotest.py`、`analyze.py` 等，詳見裡面的 README |
+| `latest/`、`stable/` | 較早的韌體版本 |
 | `libraries/` | 韌體使用的 Arduino 函式庫 |
 | `Experiments/` | 編碼器測試程式 |
 | `flow/` | 流程圖 |
@@ -98,11 +98,12 @@ Timer2（CTC 模式）中斷每 **10.13 ms（98.7 Hz）** 執行一次平衡環�
 ## 編譯與執行
 
 1. 安裝 `libraries/` 裡的 Arduino 函式庫：I2Cdev、MPU6050（含 DMP MotionApps 2.0 標頭檔）和 PinChangeInterrupt。
-2. 用 Arduino IDE 開啟 `repo.ino`。`nav.h`、`nav_cmd.h`、`rec.h`、`tuning.h` 要放在同一個資料夾，少一個就編譯不過。
+2. 用 Arduino IDE 開啟根目錄的 `repo.ino`。`nav.h`、`nav_cmd.h`、`rec.h`、`tuning.h` 要放在同一個資料夾，少一個就編譯不過。
 3. 選擇 **Arduino Uno** 並上傳。
-4. 開機最初幾秒請讓車子直立放好，它會先校正陀螺儀，再開始平衡。
+4. 開機時讓車子直立並保持不動，等 DMP 啟動。序列埠會印出啟動訊息和 `v34 EMF/OVS/FAST=111`，代表新版韌體已燒錄成功。`setup()` 裡的 MPU-6050 偏移值是這台車專用，換一台車要重新校正。
 5. 電腦配對 HC-06，執行 `python/` 裡的工具：
    ```
+   cd python
    python -m pip install pyserial
    python drive.py --port COM5
    ```

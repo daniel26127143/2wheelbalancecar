@@ -85,11 +85,11 @@ Encoders: 660 ticks per wheel turn (11-line Hall × 1:30 gearbox × 2 edges coun
 
 ## Repository layout
 
-| Folder | Content |
+| Path | Content |
 |---|---|
-| `latest/` | Latest firmware (`repo.ino`, v34, with `nav.h`, `nav_cmd.h`, `rec.h`, `tuning.h` in the same folder) |
-| `latest/python/` | PC tools: `drive.py` (drive), `nav.py` (routes), `autotest.py`, `analyze.py`, and more. See its README |
-| `stable/` | Earlier stable version |
+| `repo.ino`, `nav.h`, `nav_cmd.h`, `rec.h`, `tuning.h` | Current firmware (v34). Keep all five files in one folder |
+| `python/` | PC tools: `drive.py` (drive), `nav.py` (routes), `autotest.py`, `analyze.py`, and more. See its README |
+| `latest/`, `stable/` | Earlier firmware versions |
 | `libraries/` | Arduino libraries used by the firmware |
 | `Experiments/` | Encoder test sketches |
 | `flow/` | Flow charts |
@@ -97,12 +97,13 @@ Encoders: 660 ticks per wheel turn (11-line Hall × 1:30 gearbox × 2 edges coun
 
 ## Build and run
 
-1. Install the Arduino libraries from `libraries/`: I2Cdev, MPU6050 (with the DMP MotionApps 2.0 header) and PinChangeInterrupt.
-2. Open `repo.ino` in the Arduino IDE. Keep `nav.h`, `nav_cmd.h`, `rec.h` and `tuning.h` in the same folder, or it will not compile.
+1. Install the Arduino libraries from `libraries/` (or the Library Manager): I2Cdev, MPU6050 (with the DMP MotionApps 2.0 header) and PinChangeInterrupt.
+2. Open `repo.ino` (in the repository root) in the Arduino IDE. Keep `nav.h`, `nav_cmd.h`, `rec.h` and `tuning.h` in the same folder, or it will not compile.
 3. Select **Arduino Uno** and upload.
-4. Place the robot upright for the first seconds. It calibrates the gyro, then starts balancing.
+4. Power on with the robot upright and still while the DMP starts. The serial port prints a start message and `v34 EMF/OVS/FAST=111`, which confirms the new firmware is loaded. The MPU-6050 offsets in `setup()` belong to this unit; calibrate again for another unit.
 5. Pair the HC-06 on the PC and run the tools in `python/`:
    ```
+   cd python
    python -m pip install pyserial
    python drive.py --port COM5
    ```
