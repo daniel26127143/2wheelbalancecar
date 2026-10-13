@@ -2,7 +2,7 @@
 
 一台由共線麥克拉姆輪驅動的欠驅動兩輪倒單擺機器人。以 ATmega328P（Arduino Uno）實作，使用硬體計時器的多速率串級控制，並預留未來加裝第三顆輪子做橫移的設計。
 
-[![YouTube](https://img.shields.io/badge/YouTube-Video%20Demo-red?logo=youtube)](https://www.youtube.com/shorts/cfTprMj1Mzs)
+[![YouTube](https://img.shields.io/badge/YouTube-Video%20Demo-red?logo=youtube)](https://www.youtube.com/shorts/1qH6NnuWVuc)
 [![Platform](https://img.shields.io/badge/Platform-Arduino%20Uno-blue.svg)](https://www.arduino.cc/)
 
 [English](README.md) | [繁體中文](README_zh.md)
