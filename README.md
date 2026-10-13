@@ -2,7 +2,7 @@
 
 An underactuated two-wheel inverted pendulum robot driven by collinear Mecanum wheels. It runs on an ATmega328P (Arduino Uno) with hardware-timed, multi-rate cascade control, and is designed so that a third wheel can be added later for sideways motion.
 
-[![YouTube](https://img.shields.io/badge/YouTube-Video%20Demo-red?logo=youtube)](https://www.youtube.com/shorts/cfTprMj1Mzs)
+[![YouTube](https://img.shields.io/badge/YouTube-Video%20Demo-red?logo=youtube)](https://www.youtube.com/shorts/1qH6NnuWVuc)
 [![Platform](https://img.shields.io/badge/Platform-Arduino%20Uno-blue.svg)](https://www.arduino.cc/)
 
 [English](README.md) | [繁體中文](README_zh.md)
