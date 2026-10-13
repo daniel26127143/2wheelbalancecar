@@ -73,7 +73,7 @@ const int led = A0;
 #define ENC_R_SIGN (-1)   // 10/10 enc_test 實測：往前時 D4 與 A1 同電位
 // [v26] 距離校正：按 k 斷電、扶著車子往前推剛好 50 cm，TICKS_PER_CM = (|EL| + |ER|) / 2 / 50
 //       預設 30 是估計值（11 PPR × 30 減速比 × A 相雙邊緣 ÷ 輪周約 22 cm），請實測後修改
-#define TICKS_PER_CM 36.2f   // 10/10 實測：每圈 660 tick（11 線霍爾 × 1:30 × 2），輪徑 5.8 cm → 660 ÷ (π × 5.8)
+#define TICKS_PER_CM 36.2f   // 10/10 輪徑 65 mm；36.2 是推 50 cm 校正出來的
 volatile long enc_total_L = 0;  // [v25] 方向測試用累計 tick（倒地 / 斷電時顯示在遙測 EL / ER）
 volatile long enc_total_R = 0;
 
