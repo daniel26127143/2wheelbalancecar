@@ -1,4 +1,22 @@
 // ============================================================================
+// [v37] 航向設定鍵（Y）+ 移除「偏差大就當成有人刻意轉開」的規則（以 v36 為底）
+//   1) 按 Y（C++ drive.exe 也是 Y）：把「現在的車頭方向」記成航向設定角度（setpoint）。沒按過 Y 就不做靜止航向保持
+//      （v36 是停下 0.5 s 自動鎖，鎖在哪個方向你無法決定）。再按一次 Y = 以現在方向重設。
+//   2) 靜止時偏離設定角度超過 YAW_HOLD_ENTER 就轉回去，不管偏多少（v36 偏超過 10° 會改鎖新方向，
+//      10/17 實測你把車頭手轉開 24°、33° 都沒轉回來就是這條）。直行時（W / X）航向鎖也直接用設定角度。
+//   3) 設定角度會在這些情況作廢（要再按 Y）：A / D / C / #D 轉向 / 導航 / 倒地 / 斷電 / 緊急救援。W / X / S 不會。
+//   4) 死區依 10/12、10/13 靜止 log 重訂：ENTER 2.5° → 4.0°、EXIT 1.0° → 1.5°（站著不動時車頭自己會晃 ±3.4°，
+//      2.5° 比這還小，等於一直在追晃動）。
+// ============================================================================
+// [v36] 航向校正 + 程式精簡（以 v35 為底）
+//   新功能（各有開關，兩個都設 0 = 與 v35 行為相同）：
+//     ENABLE_YAW_HOLD  靜止航向保持：偏離設定角度超過 ±2.5° 就慢慢轉回來（見下方 YAW_HOLD_* 參數；[v37] 改成 4.0°）
+//     ENABLE_YAW_I     直行 / 導航直走加航向積分：抵消兩顆馬達的固定差異
+//   精簡（行為不變）：Control_Reset() / Heading_Reset() 取代三處重複的歸零；拿掉只寫不讀的 debug_pwm、debug_motor_L/R；
+//     wrapPi、deadzoneComp 不內嵌；C 鍵訊息縮成一行；開機訊息串成一個字串；不會被改的增益改 const。
+//   Flash（Arduino IDE 的 LTO 編譯，上限 32,256 B）：v35 31,680 → v36 兩項新功能關閉 31,098、全開 32,164（剩 92 B）。
+//   ⚠ Flash 幾乎滿了：ENABLE_TUNING 設 1 會超過上限（約多 480 B）；要加功能請先精簡（見開發紀錄補充「可精簡項目」）。
+// ============================================================================
 // [v34] 針對 10/13 實車 log（單純按住 W 5 秒、預設 7.2 → 速度衝到目標的 3.7 倍、放開後衝到 6 倍、最後倒地）的三項修改，各自有開關：
 //   ENABLE_EMF_FF          反電動勢前饋：速度快時直立環的 PWM 被馬達反電動勢抵消（V 20 時約 54 PWM），拉不回來 → 把這部分補回去
 //   ENABLE_OVERSPEED_BRAKE 超速煞車：實際速度比目標快很多時，速度外環 P 增益 ×1.6、補償角上限 3.5° → 4.0°
@@ -73,7 +91,7 @@ const int led = A0;
 #define ENC_R_SIGN (-1)   // 10/10 enc_test 實測：往前時 D4 與 A1 同電位
 // [v26] 距離校正：按 k 斷電、扶著車子往前推剛好 50 cm，TICKS_PER_CM = (|EL| + |ER|) / 2 / 50
 //       預設 30 是估計值（11 PPR × 30 減速比 × A 相雙邊緣 ÷ 輪周約 22 cm），請實測後修改
-#define TICKS_PER_CM 36.2f   // 10/10 輪徑 65 mm；36.2 是推 50 cm 校正出來的
+#define TICKS_PER_CM 33.6f   // [v37f] 10/20 實測：里程計 173.7 cm（W/X 平均）對應尺量約 187 cm → 36.2 × 173.7 / 187；等效輪徑約 6.25 cm（每圈 660 tick）。原值 36.2 = 660 ÷ (π × 5.8)
 volatile long enc_total_L = 0;  // [v25] 方向測試用累計 tick（倒地 / 斷電時顯示在遙測 EL / ER）
 volatile long enc_total_R = 0;
 
@@ -99,6 +117,7 @@ volatile long enc_total_R = 0;
 #define ENABLE_EMF_FF 1
 #define ENABLE_OVERSPEED_BRAKE 1
 #define ENABLE_FAST_START 1
+#define ENABLE_SCALED_DECEL 1  // [v35] 放開後的減速斜率隨速度放大（0 = 與 v34 相同）
 // 反電動勢前饋：|V| 超過 EMF_V_DB（靜止時 V 會在 ±7 內抖動，不補）的部分，每 1 單位補 EMF_K 的 PWM，最多 EMF_FF_MAX。
 //   實測約 2.7 PWM / 單位（10/13 log：V -16 對應 PWM 約 -45），只補約 2/3，補滿會變成正回授（速度越快推越大）
 #define EMF_K 1.8f
@@ -115,14 +134,46 @@ volatile long enc_total_R = 0;
 // 快速起步：|目標速度| < FAST_START_TV 時，起步斜坡改用 FAST_START_STEP（每 40 ms）
 #define FAST_START_TV 3.0f
 #define FAST_START_STEP 0.90f
+// [v35] 目標速度減速斜率：原本固定 MOVE_DECEL_STEP（每 40 ms 0.15），從 5.8 減到 0 約 1.5 s，但 #D 速度 18 要 4.8 s
+//   （10/14 實測：放開 W/X 後往前滑好幾秒）。改成：減速時斜率至少是「煞車前的目標速度 ÷ DECEL_UPDATES」，
+//   也就是不管多快，目標速度都在約 DECEL_UPDATES × 40 ms 內減到 0；速度 ≤ 0.15 × DECEL_UPDATES = 7.5 時完全不變。
+#define DECEL_UPDATES 50   // 50 × 40 ms ≈ 2.0 s（18 → 0；想更快就調小，例如 38 ≈ 1.5 s，太小煞車時可能後仰過頭）
+
+#define STR1_(x) #x
+#define STR_(x) STR1_(x)   // 把 #define 的數字變成字串（開機訊息用）
+
+// ★★★ [v36] 航向校正：兩顆馬達強弱不同 → 車頭會慢慢偏 ★★★
+// 10/13 log（drive.py）：車子靜止站著時車頭會自己漂（69 s 轉 -25°、80 s 轉 -27°），因為靜止時完全不做航向閉環；
+//   直走時航向環只有 P（Kp_yaw 38 PWM/rad，偏 1° 只推 0.7 PWM），兩輪的固定差異只能靠「偏一個固定角度」來平衡。
+// 1) ENABLE_YAW_HOLD：靜止航向保持。[v37] 按 Y 才記下「設定角度」（v36 是停下 0.5 s 自動鎖）；
+//    車子靜止（停下超過 1 s）時，偏離超過 YAW_HOLD_ENTER 就借用「自轉」的機制慢慢轉回，進入 YAW_HOLD_EXIT 內停止（有遲滯，不會一直抖）。
+//    修正角速度不低於 YAW_HOLD_RATE_MIN（太慢輪子推不動，nav.h 的 NAV_TURN_RATE_MIN 也是同樣原因）。
+//    死區 [v37]：10/12、10/13 靜止 log（沒有航向保持、沒被碰的段落）車頭自己晃動的幅度——
+//      3 秒內相對中位數 p50 0.6°、p90 1.2°、p95 1.7°、p99 2.9°；相對整段趨勢 p90 2.8°、p95 3.4°、p99 4.1°；
+//      遙測 Y 的解析度 0.57°；慢漂約 ±2～10°/分（開機後 1 分鐘內可達 -23°/分，DMP 暖機）。
+//    → ENTER 4.0° ≈ 晃動的 p99（只有真的漂開才會動）；EXIT 1.5° ≈ 快晃 p90 + 一格解析度（修到這裡就停，不追晃動）。
+// 2) ENABLE_YAW_I：直行 / 導航直走時，航向環加慢速積分（只在 |誤差| < YAW_I_ERR_MAX 時累積，上限 YAW_I_MAX PWM），
+//    抵消兩顆馬達的固定差異；前進 / 後退切換時歸零（兩輪差異會隨方向換號）。
+// 兩個都設 0 = 與 v35 行為相同。
+#define ENABLE_YAW_HOLD 1
+#define ENABLE_YAW_I 1
+#define YAW_HOLD_ENTER (4.0f * DEG_TO_RAD)   // 偏離設定角度超過這個值才開始修（[v37] 2.5° → 4.0°，見上面的 log 統計）
+#define YAW_HOLD_EXIT  (1.5f * DEG_TO_RAD)   // 修回到這個範圍內就停（[v37] 1.0° → 1.5°）
+#define YAW_NUDGE (0.25f * DEG_TO_RAD)        // [v37e] u / i 鍵：把設定角度每次推 -0.25° / +0.25°（把車子調成沿著你的線走）
+#define YAW_HOLD_KP 3.0f                     // 誤差 → 修正角速度 (1/s)
+#define YAW_HOLD_RATE_MIN 0.25f              // 最小修正角速度 (rad/s)
+#define YAW_HOLD_RATE_MAX 0.5f               // 最大修正角速度 (rad/s)
+#define YAW_I_KI 80.0f                       // PWM / (rad·s)：[v37c] 40 → 80（10/20 實測後退時積分每趟歸零重學，40 學不完，殘留 +0.55° 偏差）
+#define YAW_I_MAX 10.0f                      // 積分輸出上限 (PWM)
+#define YAW_I_ERR_MAX (8.0f * DEG_TO_RAD)    // 誤差超過 8° 不累積（轉向中 / 被外力轉開）
 
 // ★★★ 正統串級 PID 參數 (計算嚴格使用 SI 制：rad, rad/s) ★★★
 
 // 1. 直立內環 (Balance PD)
-float Kp_balance_normal = 1275.0;  // 比例推力 (對抗傾斜) 1300 > x >1200
+const float Kp_balance_normal = 1275.0;  // 比例推力 (對抗傾斜) 1300 > x >1200
 TUNE_VAR float Kd_balance_normal = 40.0;    // 微分阻尼 (抑制前後震盪)。[v28] D 項修好後第一次真的生效，從 40 起步，用 g / h 鍵 -10 / +10 調整（上限 150）
 
-float Kp_balance_large = 1400.0;  // 1500 > x > 1400
+const float Kp_balance_large = 1400.0;  // 1500 > x > 1400
 TUNE_VAR float Kd_balance_large = 48.0;    // 大角度緊急阻尼 (增加 50%，強制吸震防甩倒)
 
 // 2. 優先級切換門檻 (以實測發散臨界點設計之遲滯區間)
@@ -132,7 +183,7 @@ bool is_emergency_state = false;                    // 大角度狀態旗標
 
 // 3. 速度外環 (Speed PI) - 分頻執行
 TUNE_VAR float Kp_speed = 2.8;    // 速度比例增益 2.8 > x >2.6
-float Ki_speed = 0.015;  // 速度積分增益 (消除重心偏移溜車)
+const float Ki_speed = 0.015;  // 速度積分增益 (消除重心偏移溜車)
                          // [v26] 舊版這個變數沒被用到（0.005），Speed_PI 裡實際寫死 0.015 → 改成真的使用、數值不變
 
 // float Kp_speed = 2;       // 速度比例增益 2.8 > x >2.6 (原本)
@@ -158,8 +209,8 @@ float Ki_speed = 0.015;  // 速度積分增益 (消除重心偏移溜車)
 #define SPIN_HOLD_DECAY 0.93f                    // 自轉結束後每 40 ms 剩 93%（約 0.5 s 退掉）
 
 // ★★★ [v13] 前後移動參數（速度單位：左右輪平均 ticks / 40ms，負號 = 前進 W 方向）★★★
-#define MOVE_SPEED_FWD   (-5.8f)   // W 目標速度（v17 實測：-4.5 → 實際最高約 -10，約 2.3 倍）
-#define MOVE_SPEED_BACK  (7.0f)    // X 目標速度（v17 實測：5.5 → 實際最高約 10，約 1.9 倍）
+#define MOVE_SPEED_FWD   (-18.0f)  // [v37g] W 目標速度 5.8 → 18（和 drive.exe 的 --vmax 18 同速；#D 走同一條斜坡 / 減速邏輯，18 已實測）｜原註解：v17 實測：-4.5 → 實際最高約 -10，約 2.3 倍
+#define MOVE_SPEED_BACK  (17.0f)   // [v37g] X 目標速度 7.0 → 17（接近 drive.exe 的後退 17～18）｜原註解：v17 實測：5.5 → 實際最高約 10，約 1.9 倍
                                    // [v18] 兩個方向的放大倍率不同，各自調整讓實際最高速都約 12（快約 20%）
                                    // [v20] v19 實測巡航 W 約 -11.5、X 約 11.5 → 再快約 12%（-5.2→-5.8、6.3→7.0）
 #define MOVE_ACCEL_STEP  0.30f     // 起步：目標速度每 40 ms 最多增加多少（0→5.8 約 0.8 s）
@@ -233,7 +284,7 @@ float odo_yaw0 = 0.0f;                 // 原點的車頭方向 (rad)
 volatile bool odo_reset_req = false;   // 按 z 時設為 true，由控制中斷負責歸零（避免和計算同時進行）
 Nav nav;                               // [v27] 導航狀態（ISR 與 loop() 共用，見 nav.h）
 volatile float adj_setpoint = base_setpoint;
-float fall_limit = 35.0 * DEG_TO_RAD;  // 傾倒保護限制 (超過 ±35 度斷電)
+const float fall_limit = 35.0 * DEG_TO_RAD;  // 傾倒保護限制 (超過 ±35 度斷電)
 
 // 系統全域變數
 MPU6050 mpu;
@@ -250,11 +301,9 @@ volatile long encoder_count_L = 0;
 volatile long encoder_count_R = 0;
 // [v26] enc_dir_lock（自轉時鎖編碼器方向）已移除：B 相直接量方向
 volatile float debug_sa = 0.0;   // [v9] 速度外環輸出的補償角 (deg)，遙測 SA 欄位
-volatile float debug_pwm = 0.0;  // 用於 Serial 輸出的即時 PWM 數值
+// [v36] 拿掉 debug_pwm、debug_motor_L / debug_motor_R：只有寫入、從沒印出或被讀取（遙測印的是 B、T、PWM 左右）
 volatile float debug_balance_pwm = 0.0;
 volatile float debug_final_turn = 0.0;
-volatile float debug_motor_L = 0.0;
-volatile float debug_motor_R = 0.0;
 volatile int debug_pwm_L = 0;
 volatile int debug_pwm_R = 0;
 volatile float debug_yaw_rate = 0.0;
@@ -276,8 +325,8 @@ float initial_yaw = 0.0;
 bool yaw_initialized = false;  // 初始朝向鎖定旗標
 volatile bool is_homing = false;
 // 偏航 PD 參數 (閉環跟隨需要足夠剛性，建議 Kp=35~45, Kd=6~8)
-float Kp_yaw = 38.0;
-float Kd_yaw = 7.0;
+const float Kp_yaw = 38.0;
+const float Kd_yaw = 7.0;
 // 轉向指令：改為「目標旋轉角速度」 (rad/s，0 代表直行鎖定)
 volatile float target_yaw_rate_cmd = 0.0;
 volatile float drive_w = 0.0f;  // [v32] #D 連續轉向的目標角速度 (rad/s，右轉為正)；與 target_speed_cmd 同時作用，不會像 A/D 一樣把前進速度壓成 0
@@ -291,7 +340,7 @@ volatile float drive_w = 0.0f;  // [v32] #D 連續轉向的目標角速度 (rad/
 #define DZ_BLEND 2.0f         // |指令| < 2 時線性過渡，避免過零點 ±DZ 跳變
 #define MOTOR_TRIM_L 1.037f   // 左輪增益校正（沿用原值）
 
-float Kff_yaw = 30.0f;                           // 角速度前饋 (PWM per rad/s)：讓自轉不再靠「堆誤差」推動
+const float Kff_yaw = 30.0f;                           // 角速度前饋 (PWM per rad/s)：讓自轉不再靠「堆誤差」推動
 const float TURN_MAX = 45.0f;                    // 轉向差速絕對上限
 const float YAW_LEAD_MAX = 15.0f * DEG_TO_RAD;   // 目標航向最多超前實際 15°（Anti-windup）
 const float YAW_RATE_SLEW = 4.0f;                // 目標角速度加速斜率 rad/s^2（0→1 rad/s 約 0.25 s）
@@ -316,11 +365,41 @@ float heading_mem = 0.0f;         // 記住的直行航向 (rad)
 bool heading_mem_valid = false;
 bool heading_locked = false;      // 目前是否處於直行鎖航向狀態
 volatile float debug_tilt_gain = 1.0f;
+float yaw_i = 0.0f;             // [v36] 航向積分輸出 (PWM)
+float yaw_hold = 0.0f;          // [v36] 靜止航向保持的設定角度 (rad)；[v37] 按 Y 才設定
+bool yaw_hold_valid = false;    // [v36] 設定角度是否已鎖定；[v37] 按過 Y 才為 true
+bool yaw_hold_active = false;   // [v36] 目前是否正在修正（遲滯）
+volatile bool yaw_set_req = false;  // [v37] loop() 收到 Y 鍵 → 要求 ISR 把現在的車頭記成設定角度
+volatile bool yaw_pre_valid = false;   // [v37d] 倒地期間按過 Y：角度先存在 yaw_hold，站起來才把 yaw_hold_valid 打開（Heading_Reset 不會動這個旗標）
 
-float Heading_Control_PD(float current_yaw_rate, float rate_ref);
+// [v36] 倒地 / 斷電 / 緊急救援時，清掉航向鎖定、記憶、積分與靜止保持（原本三處各寫兩行）
+static void Heading_Reset() {
+  heading_mem_valid = false;
+  heading_locked = false;
+  yaw_i = 0.0f;
+  yaw_hold_valid = false;
+  yaw_hold_active = false;
+  yaw_set_req = false;
+}
+
+// [v36] 倒地 / 斷電 / 緊急救援共用的狀態歸零（原本三處各寫一份，省約 0.2 KB Flash）
+static void Control_Reset() {
+  speed_integral = 0.0;
+  speed_angle_target = 0.0;
+  filtered_speed = 0.0;
+  target_speed = 0.0;
+  move_boost = 0.0f;
+  v_slow = 0.0f;
+  spin_dx = 0.0f;
+  yaw_rate_ref = 0.0f;
+  Heading_Reset();
+}
+
+float Heading_Control_PD(float current_yaw_rate, float rate_ref, bool use_i);
 float Turn_Authority_Limit(float balance, float turn, float tilt_err);
 
-static inline float wrapPi(float a) {
+// [v36] noinline：ISR 裡有十幾處呼叫，內嵌每處都多一份浮點比較 / 加減（約省 0.2~0.4 KB Flash，代價是每次呼叫多約 10 個 CPU 週期）
+static __attribute__((noinline)) float wrapPi(float a) {
   while (a > PI) a -= TWO_PI;
   while (a < -PI) a += TWO_PI;
   return a;
@@ -340,7 +419,7 @@ void initMotorPins() {
 
 // 死區補償：與原版相同的 out = |u| + DZ（直立環增益與原版完全一致）
 // 唯一差異：|u| < DZ_BLEND 時從 0 線性爬升，過零點連續
-static inline float deadzoneComp(float u, float dz) {
+static __attribute__((noinline)) float deadzoneComp(float u, float dz) {  // [v36] noinline：左右輪各呼叫一次，不內嵌兩份
   float a = fabsf(u);
   float out;
   if (a < DZ_BLEND) {
@@ -423,7 +502,7 @@ void Code_right() {
 
 // 航向角維持與轉向閉環控制
 // rate_ref：斜坡整形後的目標角速度 (rad/s)；直行鎖航向時傳 0
-float Heading_Control_PD(float current_yaw_rate, float rate_ref) {
+float Heading_Control_PD(float current_yaw_rate, float rate_ref, bool use_i) {
   // 1. 航向誤差（最短路徑）
   float yaw_error = wrapPi(target_yaw - current_yaw);
 
@@ -443,6 +522,17 @@ float Heading_Control_PD(float current_yaw_rate, float rate_ref) {
   float turn_output = Kff_yaw * rate_ref
                       + Kp_yaw * yaw_error
                       + Kd_yaw * (rate_ref - current_yaw_rate);
+
+#if ENABLE_YAW_I
+  // 4. [v36] 慢速積分（只在直行 / 導航直走使用）：抵消兩顆馬達的固定差異
+  //    轉向權限被壓縮（傾角大）或誤差太大時不累積，避免積分在「推不動」時一路堆高
+  if (use_i) {
+    if (fabsf(yaw_error) < YAW_I_ERR_MAX && debug_tilt_gain > 0.99f) {
+      yaw_i = constrain(yaw_i + YAW_I_KI * yaw_error * CTRL_DT, -YAW_I_MAX, YAW_I_MAX);
+    }
+    turn_output += yaw_i;
+  }
+#endif
 
   return constrain(turn_output, -TURN_MAX, TURN_MAX);
 }
@@ -581,11 +671,9 @@ void setup() {
     mpu.setDMPEnabled(true);
     dmpReady = true;
     packetSize = mpu.dmpGetFIFOPacketSize();
-    Serial.println("DMP 啟動成功，進入正統雙閉環模式");
-    Serial.print(F("v34 EMF/OVS/FAST="));  // [v34] 確認有沒有燒到新版
-    Serial.print(ENABLE_EMF_FF);
-    Serial.print(ENABLE_OVERSPEED_BRAKE);
-    Serial.println(ENABLE_FAST_START);
+    Serial.println(F("DMP OK"));  // [v36] F()：字串留在 Flash，省 RAM
+    // [v36] 確認有沒有燒到新版（六個旗標預期 111111）；用字串串接成一行，比逐個 Serial.print 省 Flash
+    Serial.println(F("v37g " STR_(ENABLE_YAW_HOLD) STR_(ENABLE_YAW_I)));
   } else {
     while (1)
       ;
@@ -681,9 +769,7 @@ ISR(TIMER2_COMPA_vect) {
       is_fallen = true;
       is_emergency_state = false;
       stopMotors();
-      speed_integral = 0.0;
-      filtered_speed = 0.0;
-      speed_angle_target = 0.0;
+      Control_Reset();  // [v36] 速度積分 / 補償角 / 目標速度 / 起步推力 / 自轉定點 / 轉向斜坡 / 航向鎖定（原本逐行寫在這裡）
       adj_setpoint = base_setpoint;
       encoder_count_L = 0;
       encoder_count_R = 0;
@@ -691,15 +777,8 @@ ISR(TIMER2_COMPA_vect) {
       target_speed_cmd = 0.0;
       drive_w = 0.0f;  // [v32]
       drive_ref = 0.0f;
-      target_speed = 0.0;
-      move_boost = 0.0f;  // [v20]
-      v_slow = 0.0f;
-      spin_dx = 0.0f;     // [v24]
       yaw_initialized = false;
-      yaw_rate_ref = 0.0f;  // [新增] 轉向斜坡歸零
       is_homing = false;
-      heading_mem_valid = false;  // [v22]
-      heading_locked = false;
     }
     // =========================================================================
     // 正常運行防線（未摔倒）
@@ -709,18 +788,9 @@ ISR(TIMER2_COMPA_vect) {
       if (motor_kill) {
         if (Nav_Active(&nav)) Nav_Finish(&nav, NAV_RES_ABORT, NAV_AB_USER, nav.remaining);  // [v27]
         if (!is_fallen) {
-          speed_integral = 0.0;
-          filtered_speed = 0.0;
-          speed_angle_target = 0.0;
-          target_speed = 0.0;
-          move_boost = 0.0f;  // [v20]
-          v_slow = 0.0f;
-          spin_dx = 0.0f;     // [v24]
+          Control_Reset();  // [v36]
           yaw_initialized = false;
-          yaw_rate_ref = 0.0f;
           is_homing = false;
-          heading_mem_valid = false;  // [v22]
-          heading_locked = false;
           is_emergency_state = false;
         }
         is_fallen = true;
@@ -739,6 +809,9 @@ ISR(TIMER2_COMPA_vect) {
               encoder_count_R = 0;
             }
             filtered_speed = 0.0f;
+#if ENABLE_YAW_HOLD
+            if (yaw_pre_valid) { yaw_hold_valid = true; yaw_pre_valid = false; }  // [v37c] 倒地時設定的航向，站起來生效
+#endif
           }
         }
       }
@@ -755,28 +828,22 @@ ISR(TIMER2_COMPA_vect) {
         // =======================================================================
         if (is_emergency_state) {
           if (Nav_Active(&nav)) Nav_Finish(&nav, NAV_RES_ABORT, NAV_AB_EMERG, nav.remaining);  // [v27]
-          speed_integral = 0.0;
-          speed_angle_target = 0.0;
-          target_speed = 0.0;
-          move_boost = 0.0f;  // [v20]
-          v_slow = 0.0f;
-          spin_dx = 0.0f;     // [v24]
+#if ENABLE_YAW_HOLD
+          bool keep_yh = yaw_hold_valid;  // [v37b] 大角度扭轉造成傾斜>7°不該取消 Y 設定（倒地 / 斷電仍會清除）
+#endif
+          Control_Reset();  // [v36]
+#if ENABLE_YAW_HOLD
+          yaw_hold_valid = keep_yh;
+#endif
           adj_setpoint = base_setpoint;
           target_yaw = current_yaw;
-          yaw_rate_ref = 0.0f;  // [新增]
-          heading_mem_valid = false;  // [v22]
-          heading_locked = false;
           encoder_count_L = 0;
           encoder_count_R = 0;
-          filtered_speed = 0.0;
 
           float emergency_pwm = Balance_PD(current_angle, adj_setpoint, current_gyro_rate, true);
-          debug_pwm = emergency_pwm;
           debug_balance_pwm = emergency_pwm;
           debug_final_turn = 0.0;
           debug_tilt_gain = 0.0f;
-          debug_motor_L = emergency_pwm;
-          debug_motor_R = emergency_pwm;
           debug_target_yaw = target_yaw;
           setMotorSpeed(emergency_pwm, emergency_pwm);
         }
@@ -785,6 +852,7 @@ ISR(TIMER2_COMPA_vect) {
         // =======================================================================
         else {
           // ---------- [A] 轉向指令整形：決定期望角速度 → 斜坡限制 ----------
+          static uint8_t heading_hold = 0;  // [v22] 停下後繼續鎖航向的倒數（[D] 更新；[v36] 移到這裡，靜止航向保持要看它）
           // [v27] 導航：處理 loop() 送來的 #T / #M / #A 請求
           float nav_yaw_rel = wrapPi(current_yaw - odo_yaw0);
           Nav_Service(&nav, nav_yaw_rel, odo_x, odo_y, TICKS_PER_CM);
@@ -805,6 +873,34 @@ ISR(TIMER2_COMPA_vect) {
               rate_des = constrain(HOMING_KP * homing_err, -HOMING_RATE_MAX, HOMING_RATE_MAX);
             }
           }
+#if ENABLE_YAW_HOLD
+          // [v37] 靜止航向保持（只有按過 Y 才有設定角度）：
+          //   轉向類操作（A / D、#D 轉向、C 回正、導航）= 你要換方向 → 設定角度作廢，要再按 Y；
+          //   W / X / S 不影響設定角度；目標速度歸零且停下超過 1 s（heading_hold == 0）才修正；
+          //   偏離超過 YAW_HOLD_ENTER 就用「自轉」的路徑轉回來（和 A/D、C 鍵、#T 同一條路：有角速度斜坡、自轉定點補償），
+          //   回到 YAW_HOLD_EXIT 內停止。不管偏多大都轉回來（[v37] 拿掉 v36「偏超過 10° 改鎖新方向」的規則）。
+          {
+            if (rate_des != 0.0f || is_homing || nav.state != NAV_IDLE || drive_w != 0.0f || fabsf(drive_ref) >= 0.005f) {
+              yaw_hold_valid = false;
+              yaw_set_req = false;
+            } else if (yaw_set_req) {
+              yaw_hold = current_yaw;  // Y 鍵：現在的車頭方向 = 設定角度
+              yaw_hold_valid = true;
+              yaw_set_req = false;
+            }
+            if (yaw_hold_valid && target_speed == 0.0f && target_speed_cmd == 0.0f && heading_hold == 0) {
+              float he = wrapPi(yaw_hold - current_yaw);
+              if (fabsf(he) > YAW_HOLD_ENTER) yaw_hold_active = true;
+              else if (fabsf(he) < YAW_HOLD_EXIT) yaw_hold_active = false;
+              if (yaw_hold_active) {
+                float r = constrain(YAW_HOLD_KP * fabsf(he), YAW_HOLD_RATE_MIN, YAW_HOLD_RATE_MAX);
+                rate_des = (he > 0.0f) ? r : -r;
+              }
+            } else {
+              yaw_hold_active = false;
+            }
+          }
+#endif
           // [v12] 加速用 YAW_RATE_SLEW，減速（往 0 靠近）用較緩的 YAW_RATE_DECEL
           bool decelerating = (fabsf(rate_des) < fabsf(yaw_rate_ref)) || (rate_des * yaw_rate_ref < 0.0f);
           const float slew_step = (decelerating ? YAW_RATE_DECEL : YAW_RATE_SLEW) * CTRL_DT;
@@ -861,9 +957,19 @@ ISR(TIMER2_COMPA_vect) {
               bool reversing = (target_speed_cmd * target_speed < 0.0f);
               bool braking = reversing || (fabsf(target_speed_cmd) < fabsf(target_speed));
               float step = (braking && !reversing) ? MOVE_DECEL_STEP : MOVE_ACCEL_STEP;
+#if ENABLE_SCALED_DECEL
+              // [v35] 加速 / 巡航時記住目前速度；開始減速後，斜率至少是「那個速度 ÷ DECEL_UPDATES」（固定斜率，不是逐步變小）
+              static float decel_ref = 0.0f;
+              if (!braking) {
+                decel_ref = fabsf(target_speed);
+              } else if (!reversing) {
+                float s_dec = decel_ref / DECEL_UPDATES;
+                if (s_dec > step) step = s_dec;
+              }
+#endif
 #if ENABLE_FAST_START
               // [v34] 目標速度還在 ±FAST_START_TV 內時車子本來就推不動（log：TV 到約 -3 才開始動），不必慢慢爬
-              if (step == MOVE_ACCEL_STEP && fabsf(target_speed) < FAST_START_TV) step = FAST_START_STEP;
+              if ((!braking || reversing) && fabsf(target_speed) < FAST_START_TV) step = FAST_START_STEP;  // [v35] 原本寫 step == MOVE_ACCEL_STEP，加了減速縮放後可能誤中
 #endif
               if (target_speed < target_speed_cmd) {
                 target_speed = min(target_speed + step, target_speed_cmd);
@@ -958,12 +1064,10 @@ ISR(TIMER2_COMPA_vect) {
 #if ENABLE_EMF_FF
           balance_pwm = constrain(balance_pwm + emfFF(filtered_speed), -PWM_LIMIT, PWM_LIMIT);  // [v34]
 #endif
-          debug_pwm = balance_pwm;
 
           // ---------- [D] 航向環 ----------
           float final_turn = 0.0f;
-          // [v22] 直行（含煞車滑行）期間都算「移動中」，停下後再鎖 1 s
-          static uint8_t heading_hold = 0;
+          // [v22] 直行（含煞車滑行）期間都算「移動中」，停下後再鎖 1 s（heading_hold 在 [A] 宣告）
           bool move_active = (fabsf(target_speed_cmd) > 0.1f) || (target_speed != 0.0f);
           if (move_active) heading_hold = HEADING_HOLD_TICKS;
           else if (heading_hold > 0) heading_hold--;
@@ -975,26 +1079,36 @@ ISR(TIMER2_COMPA_vect) {
             drive_ref += (dd > st) ? st : ((dd < -st) ? -st : dd);
           }
           bool driving = !turning && (fabsf(drive_ref) > 0.005f);
+#if ENABLE_YAW_I
+          {  // [v36] 前進 / 後退切換時航向積分歸零（兩輪的固定差異會隨方向換號）；同方向再出發則保留
+            static int8_t yi_dir = 0;
+            int8_t d = (target_speed > 0.0f) ? 1 : ((target_speed < 0.0f) ? -1 : 0);
+            if (d != 0 && d != yi_dir) {
+              if (yi_dir != 0) yaw_i = 0.0f;
+              yi_dir = d;
+            }
+          }
+#endif
 
           if (turning) {  // 自轉 / 回正（含加減速斜坡段）
             heading_mem_valid = false;  // [v22] 方向被刻意改變：記憶作廢
             heading_locked = false;
             heading_hold = 0;
             target_yaw = wrapPi(target_yaw + yaw_rate_ref * CTRL_DT);
-            final_turn = Heading_Control_PD(current_yaw_rate, yaw_rate_ref);
+            final_turn = Heading_Control_PD(current_yaw_rate, yaw_rate_ref, false);
           } else if (nav.state == NAV_MOVE || nav.state == NAV_STOP) {  // [v27] 導航直走：鎖在出發時的方向
             target_yaw = wrapPi(odo_yaw0 + nav.move_heading);
             heading_locked = true;
             heading_mem = target_yaw;
             heading_mem_valid = true;
-            final_turn = Heading_Control_PD(current_yaw_rate, nav.yaw_ff);  // [v30] 直走時 yaw_ff = 0；#C 弧線時 = 曲率 × 前進速度
+            final_turn = Heading_Control_PD(current_yaw_rate, nav.yaw_ff, fabsf(nav.yaw_ff) < 0.001f);  // [v30] 直走時 yaw_ff = 0；#C 弧線時 = 曲率 × 前進速度；[v36] 只有直走加積分
           } else if (driving) {  // [v32] #D：邊走邊轉（目標航向跟著 drive_ref 前進，角速度前饋 = drive_ref）
             if (!heading_locked) {
               target_yaw = current_yaw;
               heading_locked = true;
             }
             target_yaw = wrapPi(target_yaw + drive_ref * CTRL_DT);
-            final_turn = Heading_Control_PD(current_yaw_rate, drive_ref);
+            final_turn = Heading_Control_PD(current_yaw_rate, drive_ref, false);
           } else if (move_active || heading_hold > 0) {  // 直行 + 煞車 + 停下後 1 s：鎖航向
             if (!heading_locked) {  // [v22] 這一次移動剛開始：決定要鎖哪個方向
               if (heading_mem_valid && fabsf(wrapPi(heading_mem - current_yaw)) < HEADING_MEM_MAX) {
@@ -1004,7 +1118,13 @@ ISR(TIMER2_COMPA_vect) {
               }
               heading_locked = true;
             }
-            final_turn = Heading_Control_PD(current_yaw_rate, 0.0f);
+#if ENABLE_YAW_HOLD
+            // [v37] 按過 Y：直行 / 煞車 / 停後 1 s 都鎖設定角度，而且每個 tick 都改回設定角度——
+            //       Heading_Control_PD 的 Anti-windup 會把目標拖到「現在 ± 15°」，不改回來的話偏很多時目標被拖偏，永遠到不了設定角度
+            //       （偏多少都往設定角度修，不再假設「偏很多 = 有人刻意轉開」）
+            if (yaw_hold_valid) target_yaw = yaw_hold;
+#endif
+            final_turn = Heading_Control_PD(current_yaw_rate, 0.0f, true);
             heading_mem = target_yaw;
             heading_mem_valid = true;
           } else {  // 靜止：不做航向閉環
@@ -1022,9 +1142,11 @@ ISR(TIMER2_COMPA_vect) {
 
           debug_balance_pwm = balance_pwm;
           debug_final_turn = turn_cmd;
-          debug_motor_L = motor_L;
-          debug_motor_R = motor_R;
+#if ENABLE_YAW_HOLD
+          debug_target_yaw = yaw_hold_valid ? yaw_hold : target_yaw;  // [v36] 靜止保持時，遙測 TY 顯示鎖定的設定角度
+#else
           debug_target_yaw = target_yaw;
+#endif
           setMotorSpeed(motor_L, motor_R);
         }
       }
@@ -1041,6 +1163,13 @@ const unsigned long CMD_TIMEOUT = 300;  // 超過 300ms 沒訊號自動煞停 (�
 
 #include "nav_cmd.h"  // [v31] 導航指令解析 Nav_HandleLine() 與回報 Nav_Report()
 #include "tuning.h"  // [v33] 現場調參按鍵 Tune_Key()（ENABLE_TUNING 為 0 時是空的）
+
+#if ENABLE_YAW_HOLD
+static __attribute__((noinline)) void YawSetMsg(float rad) {  // [v37e] Y / U / I 共用的回應（省 Flash）
+  Serial.print(F(">> 航向 "));
+  Serial.println(rad * RAD_TO_DEG, 1);
+}
+#endif
 
 void loop() {
   // 1. 鍵盤 / 序列埠指令監聽
@@ -1077,9 +1206,36 @@ void loop() {
     // [v26] z：虛擬座標歸零（目前位置 = 原點、目前車頭 = X 軸）
     if (c == 'z' || c == 'Z') {
       odo_reset_req = true;
-      Serial.println(F(">> 座標歸零"));
+      Serial.println(F(">> Z"));
       continue;
     }
+
+#if ENABLE_YAW_HOLD
+    // [v37] y：把現在的車頭方向記成航向設定角度（沒按過就不做靜止航向保持；再按一次 = 重設）
+    //       倒地 / 導航中不接受（導航中按任何轉向 / 導航動作本來就會讓設定作廢）。放在 z 旁邊：不取消 #D，不當成移動鍵
+    if (c == 'y' || c == 'Y') {
+      if (!Nav_Active(&nav)) {
+        float yv;
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+          yv = debug_yaw;
+          if (is_fallen) { yaw_hold = yv; yaw_pre_valid = true; }  // [v37c] 倒地：先記著，站起來才生效
+          else yaw_set_req = true;
+        }
+        YawSetMsg(yv);
+      }
+      continue;
+    }
+    // [v37e] u / i：設定角度 -0.5° / +0.5°（只在已有設定角度時有效；走直線時立刻生效，停著時要偏超過死區才會轉）
+    if (c == 'u' || c == 'U' || c == 'i' || c == 'I') {
+      bool ok = false;
+      float yv = 0.0f;
+      ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        if (yaw_hold_valid || yaw_pre_valid) { yaw_hold = wrapPi(yaw_hold + ((c == 'i' || c == 'I') ? YAW_NUDGE : -YAW_NUDGE)); yv = yaw_hold; ok = true; }
+      }
+      if (ok) YawSetMsg(yv);  // [v37e] 沒有設定角度時不回應（要先按 Y）
+      continue;
+    }
+#endif
 
     if (REC_KEY(c)) continue;  // [v28] 診斷錄影 r / m 鍵（ENABLE_REC 為 0 時整行不會編譯）
 
@@ -1088,7 +1244,7 @@ void loop() {
       if (motor_kill) {  // [v25] 進入斷電模式時把方向測試累計歸零
         ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { enc_total_L = 0; enc_total_R = 0; }
       }
-      Serial.println(motor_kill ? F(">> 馬達強制斷電（手扶量測模式）") : F(">> 馬達解除斷電（扶正後自動啟動）"));
+      Serial.println(motor_kill ? F(">> 馬達斷電") : F(">> 馬達啟動"));
       continue;
     }
 
@@ -1132,9 +1288,7 @@ void loop() {
         case 'C':
           is_homing = true;  // 啟動回正程序
           // [重構] 不再清 speed_integral：它保存重心補償，清掉會讓直立目標角瞬間跳變
-          Serial.println(F("\n=============================="));
-          Serial.println(F(">> [指令確認] 正在自動旋轉回正中..."));
-          Serial.println(F("==============================\n"));
+          Serial.println(F(">> C"));  // [v36] 原本上下各一行 ==== 分隔線，省約 80 B Flash
           break;
 
         // 煞停 / 暫停 (S 或 空白鍵)
@@ -1173,12 +1327,9 @@ void loop() {
   if (millis() - lastPrint > 200) {
     lastPrint = millis();
     float snapshot_angle;
-    float snapshot_debug_pwm;
     float snapshot_sa;
     float snapshot_balance_pwm;
     float snapshot_final_turn;
-    float snapshot_motor_L;
-    float snapshot_motor_R;
     int snapshot_pwm_L;
     int snapshot_pwm_R;
     float snapshot_yaw_rate;
@@ -1187,12 +1338,9 @@ void loop() {
     float snapshot_tilt_gain;
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
       snapshot_angle = current_angle;
-      snapshot_debug_pwm = debug_pwm;
       snapshot_sa = debug_sa;
       snapshot_balance_pwm = debug_balance_pwm;
       snapshot_final_turn = debug_final_turn;
-      snapshot_motor_L = debug_motor_L;
-      snapshot_motor_R = debug_motor_R;
       snapshot_pwm_L = debug_pwm_L;
       snapshot_pwm_R = debug_pwm_R;
       snapshot_yaw_rate = debug_yaw_rate;

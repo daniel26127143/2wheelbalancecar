@@ -23,8 +23,8 @@
 
 // ---------------- 參數（實測後主要調這幾個） ----------------
 // 轉向
-#define NAV_TURN_KP        1.5f    // 角度誤差 → 目標角速度 (1/s)：誤差 30° → 0.79 rad/s
-#define NAV_TURN_RATE_MAX  0.8f    // 最大角速度 (rad/s)，與 C 鍵回正相同
+#define NAV_TURN_KP        2.0f    // [v37g] 原 1.5：調高，單步 30° 時才能真的用到接近 RATE_MAX 的轉速（原 1.5 × 30° = 0.79 rad/s，連 0.8 都到不了） ｜ 原註解：角度誤差 → 目標角速度 (1/s)：誤差 30° → 0.79 rad/s
+#define NAV_TURN_RATE_MAX  1.0f    // [v37g] 原 0.8：= repo A / D 鍵的自轉角速度（1.0 rad/s） ｜ 原註解：最大角速度 (rad/s)，與 C 鍵回正相同
 #define NAV_TURN_RATE_MIN  0.25f   // 最小角速度：誤差小時也要給，否則麥克拉姆輪可能轉不動
 #define NAV_TURN_TOL       (2.5f * 0.0174533f)  // 到達判定：誤差 < 2.5°
 #define NAV_TURN_STILL     0.15f   // 到達判定：角速度 < 0.15 rad/s
@@ -33,11 +33,11 @@
 #define NAV_TURN_LEAD      0.3f    // 預估提前量 (s)：用「誤差 − 角速度 × 0.3 s」決定轉速，提早減速避免轉過頭
                                    // （實測放開 A/D 後車身還會多轉約 35°，延遲很大）
 // 直走
-#define NAV_TV_MAX         5.8f    // 前進的最大目標速度（v29：4.0 會走走停停；改成和遙控 W 鍵同速 5.8 就很順，D 項修好後 5.8 不會倒）
-#define NAV_SLOW_CM        20.0f   // 剩下多少公分開始減速（目標速度 ∝ 剩餘距離）
-#define NAV_TV_MIN         3.0f    // 前進還沒到時的最小目標速度（實測 < 3 就會卡住）
-#define NAV_TV_MAX_BACK    5.0f    // 後退的最大目標速度（v29：陀螺儀修好後前後退速度比約相同 ≈2.3 倍，2.5 實測會卡住來回晃）
-#define NAV_TV_MIN_BACK    2.5f    // 後退的最小目標速度（v29：1.2~2.0 推不動，需要 ≥2.5）
+#define NAV_TV_MAX         18.0f    // [v37g] 原 5.8：前進最大目標速度 = drive 的 --vmax（18） ｜ 原註解：前進的最大目標速度（v29：4.0 會走走停停；改成和遙控 W 鍵同速 5.8 就很順，D 項修好後 5.8 不會倒）
+#define NAV_SLOW_CM        35.0f    // [v37g] 原 20.0：速度提高後要更早開始減速 ｜ 原註解：剩下多少公分開始減速（目標速度 ∝ 剩餘距離）
+#define NAV_TV_MIN         12.0f    // [v37g] 原 3.0：（10/27 使用者指定 12：6 在 10/27 圓角長方形卡住兩次；代價是停車多滑）前進最小目標速度（9 → 6：9 在停車時粗估多滑 5~8 cm；原 3.0 在 v34 以前會卡住） ｜ 原註解：前進還沒到時的最小目標速度（實測 < 3 就會卡住）
+#define NAV_TV_MAX_BACK    17.0f    // [v37g] 原 5.0：後退最大目標速度 = repo 的 X 鍵（17） ｜ 原註解：後退的最大目標速度（v29：陀螺儀修好後前後退速度比約相同 ≈2.3 倍，2.5 實測會卡住來回晃）
+#define NAV_TV_MIN_BACK    12.0f    // [v37g] 原 2.5：（10/27 跟前進一起改 12）後退最小目標速度（9 → 6，同上） ｜ 原註解：後退的最小目標速度（v29：1.2~2.0 推不動，需要 ≥2.5）
 #define NAV_POS_TOL_CM     2.0f    // 剩餘距離 < 2 cm → 目標速度歸零、進入停車
 #define NAV_SETTLE_TOL_CM  3.0f    // 停車判定：剩餘距離 < 3 cm（用位置判斷，不被煞車後的前後晃動影響）
 #define NAV_STILL_V        6.0f    // 停車判定：|平均速度| < 6.0（只是排除「還在衝」，煞車後晃動可到 ±10）
@@ -46,7 +46,10 @@
 #define NAV_SETTLE_MAX     75      // 停車階段最多 3 s；逾時時若剩餘距離 < 2 × NAV_POS_TOL_CM 仍算完成
 #define NAV_MOVE_TIME_BASE 100     // 直走逾時：100 × 40 ms = 4 s ...
 #define NAV_MOVE_TIME_PER_CM 9     // ... 再加每公分 9 × 40 ms = 0.36 s
-#define NAV_TV_ARC_CAP     12.0f   // 弧線 #C 可指定的最大前進目標速度（5.8 = 遙控 W 鍵同速；實測 8 可以，更高的沒測過）
+#define NAV_TV_ARC_CAP     15.0f   // [v37g] 10/27 12.0 → 15.0：使用者要圓弧跑 15 ｜  弧線 #C 可指定的最大前進目標速度（5.8 = 遙控 W 鍵同速；實測 8 可以，更高的沒測過）
+#define NAV_TV_ARC_DEF     8.0f    // [v37g] 10/27 → 8：12 過彎甩太寬、轉過頭；弧線改成自己的速度範圍（NAV_TV_ARC_MIN～CAP），不受 NAV_TV_MIN 限制。弧線 #C 沒指定速度時的預設前進目標速度（NAV_TV_MAX 調到 18 後，弧線不能跟著跑 18：上限 NAV_TV_ARC_CAP、實測只到 8；也不能低於 NAV_TV_MIN）
+#define NAV_TV_ARC_MIN     6.0f    // [v37g] 弧線可指定的最小速度（--speed）；弧線全程用同一個速度，不在每段結尾減速（連續弧線中途減速會卡住）
+#define NAV_ARC_SLOW_CM    15.0f   // [v37g] 弧線剩下多少公分開始減速（連續弧線在剩 5 cm 時就接下一段，幾乎不受影響）
 #define NAV_DT_V           0.0405f // 速度外環週期 (s)（4 × 10.13 ms），弧線時由位移換算前進速度
 #define NAV_FF_FILT        0.7f    // 弧線角速度前饋的濾波：新 = 0.7 × 舊 + 0.3 × 量測
 
@@ -157,7 +160,7 @@ static inline void Nav_Service(Nav* n, float yaw_rel, float x, float y, float ti
     n->kind = k;
     n->state = NAV_MOVE;
     n->curv = 0; n->yaw_ff = yf; n->s_arc = 0; n->h0 = mh; n->px = x; n->py = y;
-    n->tv_fwd = (k == 'C' && n->req_tv > 0.0f) ? Nav_Clamp(n->req_tv, NAV_TV_MIN, NAV_TV_ARC_CAP) : NAV_TV_MAX;
+    n->tv_fwd = (k == 'C' && n->req_tv > 0.0f) ? Nav_Clamp(n->req_tv, NAV_TV_ARC_MIN, NAV_TV_ARC_CAP) : (k == 'C' ? NAV_TV_ARC_DEF : NAV_TV_MAX);
     if (k == 'C') {                // 弧線：req_heading 放的是曲率 (rad/tick)
       n->curv = n->req_heading;
       n->move_heading = mh;
@@ -226,7 +229,7 @@ static inline float Nav_MoveSpeed(Nav* n, float x, float y, float v, float ticks
 
   if (++n->timer >= n->timeout) {
     // 停車階段逾時：位置已經夠近就算完成（車身晃動不該讓整個動作失敗）
-    bool ok = (n->state == NAV_STOP) && fabsf(r) < (n->curv != 0.0f ? 5.0f : 2.0f) * tol;  // 弧線衝比較快，容許多滑一點
+    bool ok = (n->state == NAV_STOP) && fabsf(r) < (n->curv != 0.0f ? 8.0f : 5.0f) * tol;   // [v37g] 5/2 → 8/5（約 16 / 10 cm）：速度提高後停車會多滑，不要因此中止整條路線  // 弧線衝比較快，容許多滑一點
     Nav_Finish(n, ok ? NAV_RES_DONE : NAV_RES_TIMEOUT, 0, r);
     return 0.0f;
   }
@@ -240,9 +243,14 @@ static inline float Nav_MoveSpeed(Nav* n, float x, float y, float v, float ticks
       return 0.0f;
     }
     float vmax = (r > 0) ? n->tv_fwd : NAV_TV_MAX_BACK;    // 前進 / 後退各用自己的速度範圍
+    if (r > 0 && n->curv != 0.0f) {                       // [v37g] 弧線：維持弧線速度，只有最後 NAV_ARC_SLOW_CM 才減速（10/27 不減速時單段停車衝過頭 10 cm）
+      float a = n->tv_fwd * r / (NAV_ARC_SLOW_CM * ticks_per_cm);
+      if (a > n->tv_fwd) a = n->tv_fwd;
+      if (a < NAV_TV_ARC_MIN) a = NAV_TV_ARC_MIN;
+      return -a;
+    }
     float vmin = (r > 0) ? NAV_TV_MIN : NAV_TV_MIN_BACK;
-    float slow = NAV_SLOW_CM * ((r > 0 && n->tv_fwd > NAV_TV_MAX) ? n->tv_fwd / NAV_TV_MAX : 1.0f);  // 跑得越快，越早開始減速
-    float k = vmax / (slow * ticks_per_cm);                 // 剩 slow 公分時剛好開始減速
+    float k = vmax / (NAV_SLOW_CM * ticks_per_cm);          // 剩 NAV_SLOW_CM 公分時剛好開始減速（[v37g] 弧線已在上面直接回傳，不用再依弧線速度放大）
     float fwd = Nav_Clamp(k * r, -vmax, vmax);              // 往前為正
     if (fabsf(fwd) < vmin) fwd = (r > 0) ? vmin : -vmin;
     return -fwd;                          // 速度外環：負 = 前進
