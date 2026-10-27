@@ -1,0 +1,53 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "▶ 編譯並執行（目前開啟的 nav.cpp 或 drive.cpp）",
+      "type": "shell",
+      "command": "build_run.bat",
+      "args": ["${fileBasenameNoExtension}"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": { "executable": "C:\\Windows\\System32\\cmd.exe", "args": ["/d", "/c"] }
+      },
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "always", "focus": true, "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "▶ 編譯並執行 nav（選單）",
+      "type": "shell",
+      "command": "build_run.bat",
+      "args": ["nav"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": { "executable": "C:\\Windows\\System32\\cmd.exe", "args": ["/d", "/c"] }
+      },
+      "presentation": { "reveal": "always", "focus": true, "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "▶ 編譯並執行 drive（鍵盤遙控）",
+      "type": "shell",
+      "command": "build_run.bat",
+      "args": ["drive"],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": { "executable": "C:\\Windows\\System32\\cmd.exe", "args": ["/d", "/c"] }
+      },
+      "presentation": { "reveal": "always", "focus": true, "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "只編譯（drive.exe + nav.exe）",
+      "type": "shell",
+      "command": "build.bat",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": { "executable": "C:\\Windows\\System32\\cmd.exe", "args": ["/d", "/c"] }
+      },
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": ["$gcc"]
+    }
+  ]
+}
